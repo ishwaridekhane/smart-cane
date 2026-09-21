@@ -27,7 +27,7 @@ class_counts = {}
 id_display_names = {}
 frame_count = 0
 
-print(f"Analyzing '{video_path}' with false-positive filtering...\n")
+print(f"Analyzing '{video_path}' ...\n")
 
 while cap.isOpened():
     ret, frame = cap.read()
