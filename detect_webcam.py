@@ -1,7 +1,6 @@
 import cv2
 import sys
 import math
-import time
 from collections import deque
 from ultralytics import YOLO
 
@@ -11,22 +10,19 @@ from ultralytics import YOLO
 MODEL_PATH = "yolov8n.pt"
 video_path = sys.argv[1] if len(sys.argv) > 1 else "street_walk.mp4"
 
-# Optimized for Raspberry Pi 4 CPU
-IMG_SIZE = 480
-CONFIDENCE = 0.35
-FRAME_SKIP = 2
+# Performance tuning for Raspberry Pi 4 CPU
+IMG_SIZE = 384
+CONFIDENCE = 0.48
+FRAME_SKIP = 3
 
-# Global Alert Cooldown
 ALERT_COOLDOWN = 3.5
 EMERGENCY_COOLDOWN = 1.2
 
-# Tracking constants
-MAX_TRACK_DISTANCE = 130
-MAX_TRACK_AGE = 1.2
-MIN_CONFIRMATIONS = 2
+MAX_TRACK_DISTANCE = 110
+MAX_TRACK_AGE = 1.0
+MIN_CONFIRMATIONS = 3
 MOVEMENT_HISTORY = 6
 
-# Boundaries (Hysteresis)
 LEFT_BOUNDARY = 0.35
 RIGHT_BOUNDARY = 0.65
 HYSTERESIS_RATIO = 0.05
@@ -35,12 +31,6 @@ NEAR_RATIO = 0.35
 ALLOWED_OBSTACLES = {
     "person", "bicycle", "car", "motorcycle", "bus", "truck", "dog", "chair"
 }
-
-AVERAGE_OBJECT_WIDTH_METERS = {
-    "person": 0.45, "bicycle": 0.60, "motorcycle": 0.80,
-    "car": 1.80, "bus": 2.50, "truck": 2.50, "dog": 0.40, "chair": 0.50,
-}
-APPROX_FOCAL_LENGTH_PIXELS = 700.0
 
 # ============================================================
 # INITIALIZATION
@@ -103,22 +93,22 @@ def get_movement(history):
         return "moving ahead"
     dx = history[-1][0] - history[0][0]
     dh = history[-1][1] - history[0][1]
-    h_thresh = frame_w * 0.03
+    h_thresh = frame_w * 0.035
 
-    h_move = "toward your right" if dx > h_thresh else ("toward your left" if dx < -h_thresh else None)
-    v_move = "approaching" if dh > 0.08 else ("moving away" if dh < -0.08 else None)
+    h_move = "to the right" if dx > h_thresh else ("to the left" if dx < -h_thresh else None)
+    approaching = dh > 0.08
 
-    if h_move and v_move:
-        return f"{v_move}, moving {h_move}"
+    if approaching and h_move:
+        return f"approaching from {h_move}"
+    if approaching:
+        return "approaching"
     if h_move:
-        return f"moving {h_move}"
-    if v_move:
-        return v_move
+        return f"shifting {h_move}"
     return "moving ahead"
 
 def natural_phrase(label, count):
     if label == "person":
-        return "one person" if count == 1 else (f"two people" if count == 2 else f"{count} people")
+        return "one person" if count == 1 else ("two people" if count == 2 else f"{count} people")
     return f"one {label}" if count == 1 else f"{count} {label}s"
 
 def match_detections(detections, current_sec):
@@ -140,7 +130,6 @@ def match_detections(detections, current_sec):
             trk = tracks[best_id]
             trk["x"], trk["y"] = det["x"], det["y"]
             trk["box_h"] = det["box_h"]
-            trk["box_w"] = det["box_w"]
             trk["last_seen"] = current_sec
             trk["frames_seen"] += 1
             trk["history"].append((det["x"], det["box_h"] / frame_h))
@@ -157,23 +146,21 @@ def match_detections(detections, current_sec):
                 "x": det["x"],
                 "y": det["y"],
                 "box_h": det["box_h"],
-                "box_w": det["box_w"],
                 "first_seen": current_sec,
                 "last_seen": current_sec,
                 "frames_seen": 1,
                 "history": deque([(det["x"], det["box_h"] / frame_h)], maxlen=MOVEMENT_HISTORY),
                 "zone": init_zone,
-                "proximity": "near" if (det["box_h"] / frame_h) > NEAR_RATIO else "far",
-                "announced": False
+                "proximity": "near" if (det["box_h"] / frame_h) > NEAR_RATIO else "far"
             }
             matched.add(t_id)
 
-    # Clean inactive tracks
+    # Clean stale tracks
     for t_id in [k for k, v in tracks.items() if current_sec - v["last_seen"] > MAX_TRACK_AGE]:
         del tracks[t_id]
 
 print(f"\n[SAHAYAK DRISHTI] Vision Engine Started: '{video_path}'")
-print(f"[SYSTEM] Duration: {format_time(total_duration_sec)} | Skipping every 2nd frame\n")
+print(f"[SYSTEM] Duration: {format_time(total_duration_sec)} | High-speed ARM Mode\n")
 
 # ============================================================
 # MAIN LOOP
@@ -186,6 +173,7 @@ while cap.isOpened():
     frame_count += 1
     current_sec = frame_count / fps
 
+    # Skip 2 of every 3 frames for smooth CPU framerate
     if frame_count % FRAME_SKIP != 0:
         continue
 
@@ -210,19 +198,16 @@ while cap.isOpened():
                 "label": label,
                 "x": (x1 + x2) / 2.0,
                 "y": (y1 + y2) / 2.0,
-                "box_w": x2 - x1,
-                "box_h": y2 - y1,
-                "conf": float(box.conf[0])
+                "box_h": y2 - y1
             })
 
     match_detections(detections, current_sec)
 
-    # Aggregate stable visible tracks
+    # Only consider robust tracks seen across multiple frames
     visible = [t for t in tracks.values() if (current_sec - t["last_seen"] <= 0.4 and t["frames_seen"] >= MIN_CONFIRMATIONS)]
     if not visible:
         continue
 
-    # Priority sort: (Near objects > Center objects > Larger items)
     visible.sort(key=lambda t: (t["proximity"] == "near", t["zone"] == "center", t["box_h"]), reverse=True)
     lead = visible[0]
 
@@ -230,13 +215,11 @@ while cap.isOpened():
     emergency_allowed = (current_sec - last_emergency_time >= EMERGENCY_COOLDOWN)
     cooldown_expired = (current_sec - last_alert_time >= ALERT_COOLDOWN)
 
-    # Group obstacles by zone and label to avoid single/double person flicker
     zone_members = [t for t in visible if t["label"] == lead["label"] and t["zone"] == lead["zone"]]
     count = len(zone_members)
     phrase = natural_phrase(lead["label"], count)
     movement = get_movement(lead["history"])
 
-    # High-level stable summary key (ignores trivial pixel changes)
     state_signature = f"{phrase}_{lead['zone']}_{lead['proximity']}"
 
     should_announce = False
@@ -256,14 +239,13 @@ while cap.isOpened():
             be_verb = "is" if count == 1 else "are"
             msg = f"[ALERT] There {be_verb} {phrase} {location}, {movement}."
 
-        sys.stdout.write(f"\r{' '*75}\r[{timestamp}] {msg}\n")
+        sys.stdout.write(f"\r{' '*85}\r[{timestamp}] {msg}\n")
         last_alert_time = current_sec
         last_alert_summary = state_signature
 
         timeline_records.append({
             "time": timestamp,
-            "message": msg,
-            "type": "EMERGENCY" if emergency_now else "ALERT"
+            "message": msg
         })
 
 cap.release()
