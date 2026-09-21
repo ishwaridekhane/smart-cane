@@ -8,37 +8,47 @@ if not cap.isOpened():
     print("Error opening video")
     exit()
 
-width  = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-fps    = cap.get(cv2.CAP_PROP_FPS) or 20.0
-
-fourcc = cv2.VideoWriter_fourcc(*'MJPG')
-out = cv2.VideoWriter('output.avi', fourcc, fps, (width, height))
-
-print("Fast processing started (max 2 minutes)...")
-
+active_events = {}
+completed_events = []
 frame_count = 0
-saved_count = 0
 
-# Stop at frame 150 (covers the core scene in ~90 seconds)
+print("Scanning video for object appearance intervals...\n")
+
 while cap.isOpened() and frame_count < 150:
     ret, frame = cap.read()
     if not ret:
         break
 
     frame_count += 1
-    # Skip every other frame: 2x speedup with full 640px accuracy
     if frame_count % 2 != 0:
         continue
 
-    saved_count += 1
     results = model(frame, verbose=False)
-    annotated_frame = results[0].plot()
-    out.write(annotated_frame)
+    detected_classes = set(model.names[int(c)] for c in results[0].boxes.cls)
 
-    labels = [model.names[int(c)] for c in results[0].boxes.cls]
-    print(f"Processed frame {frame_count}/150 | Detected: {labels}")
+    # Detect new objects appearing
+    for label in detected_classes:
+        if label not in active_events:
+            active_events[label] = frame_count
+            print(f"--> [{label.upper()}] entered at frame {frame_count}")
+
+    # Detect objects leaving
+    for label in list(active_events.keys()):
+        if label not in detected_classes:
+            start_f = active_events.pop(label)
+            completed_events.append((label, start_f, frame_count - 2))
+            print(f"<-- [{label.upper()}] left at frame {frame_count}")
+
+# Close any still-active objects
+for label, start_f in active_events.items():
+    completed_events.append((label, start_f, frame_count))
 
 cap.release()
-out.release()
-print(f"Done! Saved {saved_count} frames to output.avi.")
+
+# Final summary table
+print("\n" + "=" * 40)
+print("           DETECTION TIMELINE")
+print("=" * 40)
+for label, start, end in completed_events:
+    print(f"  {label.upper():<12} : Frame {start} to Frame {end}")
+print("=" * 40)
