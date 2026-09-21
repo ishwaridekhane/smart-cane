@@ -1,6 +1,8 @@
 import cv2
+import os
 import sys
 import math
+import time
 from collections import deque
 from ultralytics import YOLO
 
@@ -10,13 +12,13 @@ from ultralytics import YOLO
 MODEL_PATH = "yolov8n.pt"
 video_path = sys.argv[1] if len(sys.argv) > 1 else "street_walk.mp4"
 
-# Performance tuning for Raspberry Pi 4 CPU
 IMG_SIZE = 384
 CONFIDENCE = 0.48
 FRAME_SKIP = 3
 
 ALERT_COOLDOWN = 3.5
 EMERGENCY_COOLDOWN = 1.2
+GEMINI_COOLDOWN = 4.0
 
 MAX_TRACK_DISTANCE = 110
 MAX_TRACK_AGE = 1.0
@@ -31,6 +33,29 @@ NEAR_RATIO = 0.35
 ALLOWED_OBSTACLES = {
     "person", "bicycle", "car", "motorcycle", "bus", "truck", "dog", "chair"
 }
+
+# Average physical widths in meters for monocular distance approximation
+AVERAGE_WIDTHS = {
+    "person": 0.45, "bicycle": 0.60, "motorcycle": 0.80,
+    "car": 1.80, "bus": 2.50, "truck": 2.50, "dog": 0.40, "chair": 0.50
+}
+APPROX_FOCAL_LENGTH_PIXELS = 700.0
+
+# ============================================================
+# GENAI SETUP (GEMINI)
+# ============================================================
+gemini_client = None
+api_key = os.getenv("GEMINI_API_KEY")
+
+if api_key:
+    try:
+        from google import genai
+        gemini_client = genai.Client(api_key=api_key)
+        print("[SYSTEM] Gemini GenAI Engine: ENABLED")
+    except Exception as e:
+        print(f"[SYSTEM] Gemini setup warning: {e}")
+else:
+    print("[SYSTEM] Gemini GenAI: DISABLED (GEMINI_API_KEY environment variable not set)")
 
 # ============================================================
 # INITIALIZATION
@@ -55,6 +80,7 @@ hysteresis_margin = frame_w * HYSTERESIS_RATIO
 tracks = {}
 next_track_id = 1
 last_alert_time = -10.0
+last_gemini_time = -10.0
 last_alert_summary = ""
 last_emergency_time = -10.0
 timeline_records = []
@@ -65,6 +91,22 @@ def format_time(seconds):
 
 def distance(x1, y1, x2, y2):
     return math.hypot(x2 - x1, y2 - y1)
+
+def estimate_distance_meters(label, box_w):
+    if label not in AVERAGE_WIDTHS or box_w <= 5:
+        return None
+    raw_dist = (AVERAGE_WIDTHS[label] * APPROX_FOCAL_LENGTH_PIXELS) / box_w
+    raw_dist = max(0.5, min(25.0, raw_dist))
+    # Round to stable intervals to stop single-meter flickering
+    if raw_dist < 1.5:
+        return 1
+    elif raw_dist < 3.5:
+        return 3
+    elif raw_dist < 6.0:
+        return 5
+    elif raw_dist < 9.0:
+        return 8
+    return round(raw_dist / 5.0) * 5
 
 def get_zone(x, previous_zone):
     if previous_zone == "left":
@@ -111,6 +153,37 @@ def natural_phrase(label, count):
         return "one person" if count == 1 else ("two people" if count == 2 else f"{count} people")
     return f"one {label}" if count == 1 else f"{count} {label}s"
 
+def ask_gemini(frame, detected_info):
+    global last_gemini_time
+    if not gemini_client:
+        return None
+    now = time.time()
+    if now - last_gemini_time < GEMINI_COOLDOWN:
+        return None
+
+    try:
+        from google.genai import types
+        # Downscale frame for quick network upload
+        small_frame = cv2.resize(frame, (320, 240))
+        _, encoded = cv2.imencode(".jpg", small_frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
+
+        prompt = f"""You are the voice of a smart cane for a visually impaired user.
+Summarize the key obstacle in 1 concise, calm sentence based on these confirmed detections:
+{detected_info}
+Include distance in meters if available. Never invent details. Return only the spoken sentence."""
+
+        response = gemini_client.models.generate_content(
+            model="gemini-2.5-flash",
+            contents=[types.Part.from_bytes(data=encoded.tobytes(), mime_type="image/jpeg"), prompt],
+            config=types.GenerateContentConfig(temperature=0.1, max_output_tokens=40)
+        )
+        last_gemini_time = now
+        if response.text:
+            return response.text.strip().replace("\n", " ")
+    except Exception:
+        pass
+    return None
+
 def match_detections(detections, current_sec):
     global next_track_id
     matched = set()
@@ -126,10 +199,13 @@ def match_detections(detections, current_sec):
             if d < min_d:
                 min_d, best_id = d, t_id
 
+        dist_m = estimate_distance_meters(det["label"], det["box_w"])
+
         if best_id is not None and min_d <= MAX_TRACK_DISTANCE:
             trk = tracks[best_id]
             trk["x"], trk["y"] = det["x"], det["y"]
-            trk["box_h"] = det["box_h"]
+            trk["box_h"], trk["box_w"] = det["box_h"], det["box_w"]
+            trk["dist_m"] = dist_m
             trk["last_seen"] = current_sec
             trk["frames_seen"] += 1
             trk["history"].append((det["x"], det["box_h"] / frame_h))
@@ -146,6 +222,8 @@ def match_detections(detections, current_sec):
                 "x": det["x"],
                 "y": det["y"],
                 "box_h": det["box_h"],
+                "box_w": det["box_w"],
+                "dist_m": dist_m,
                 "first_seen": current_sec,
                 "last_seen": current_sec,
                 "frames_seen": 1,
@@ -155,7 +233,6 @@ def match_detections(detections, current_sec):
             }
             matched.add(t_id)
 
-    # Clean stale tracks
     for t_id in [k for k, v in tracks.items() if current_sec - v["last_seen"] > MAX_TRACK_AGE]:
         del tracks[t_id]
 
@@ -163,7 +240,7 @@ print(f"\n[SAHAYAK DRISHTI] Vision Engine Started: '{video_path}'")
 print(f"[SYSTEM] Duration: {format_time(total_duration_sec)} | High-speed ARM Mode\n")
 
 # ============================================================
-# MAIN LOOP
+# MAIN INFERENCE LOOP
 # ============================================================
 while cap.isOpened():
     ret, frame = cap.read()
@@ -173,7 +250,6 @@ while cap.isOpened():
     frame_count += 1
     current_sec = frame_count / fps
 
-    # Skip 2 of every 3 frames for smooth CPU framerate
     if frame_count % FRAME_SKIP != 0:
         continue
 
@@ -198,12 +274,12 @@ while cap.isOpened():
                 "label": label,
                 "x": (x1 + x2) / 2.0,
                 "y": (y1 + y2) / 2.0,
+                "box_w": x2 - x1,
                 "box_h": y2 - y1
             })
 
     match_detections(detections, current_sec)
 
-    # Only consider robust tracks seen across multiple frames
     visible = [t for t in tracks.values() if (current_sec - t["last_seen"] <= 0.4 and t["frames_seen"] >= MIN_CONFIRMATIONS)]
     if not visible:
         continue
@@ -219,8 +295,10 @@ while cap.isOpened():
     count = len(zone_members)
     phrase = natural_phrase(lead["label"], count)
     movement = get_movement(lead["history"])
+    dist_val = lead.get("dist_m")
+    dist_str = f"about {dist_val} meters" if dist_val else ""
 
-    state_signature = f"{phrase}_{lead['zone']}_{lead['proximity']}"
+    state_signature = f"{phrase}_{lead['zone']}_{dist_val}_{lead['proximity']}"
 
     should_announce = False
     if emergency_now and emergency_allowed:
@@ -233,11 +311,26 @@ while cap.isOpened():
         timestamp = format_time(current_sec)
         location = "ahead of you" if lead["zone"] == "center" else f"on your {lead['zone']}"
 
-        if emergency_now:
-            msg = f"[EMERGENCY] Careful, {phrase} is very close {location}, {movement}!"
+        # 1. Attempt natural-language verification via Gemini
+        detected_context = {
+            "obstacle": phrase,
+            "location": location,
+            "distance": dist_str,
+            "motion": movement,
+            "emergency": emergency_now
+        }
+        gemini_msg = ask_gemini(frame, detected_context)
+
+        # 2. Deterministic fallback if Gemini is offline or rate-limited
+        if gemini_msg:
+            msg = f"[{'EMERGENCY' if emergency_now else 'ALERT'}] {gemini_msg}"
         else:
-            be_verb = "is" if count == 1 else "are"
-            msg = f"[ALERT] There {be_verb} {phrase} {location}, {movement}."
+            dist_clause = f" {dist_str}" if dist_str else ""
+            if emergency_now:
+                msg = f"[EMERGENCY] Careful, {phrase} is very close {location}{dist_clause}, {movement}!"
+            else:
+                be_verb = "is" if count == 1 else "are"
+                msg = f"[ALERT] There {be_verb} {phrase} {location}{dist_clause}, {movement}."
 
         sys.stdout.write(f"\r{' '*85}\r[{timestamp}] {msg}\n")
         last_alert_time = current_sec
