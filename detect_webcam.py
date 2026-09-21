@@ -12,7 +12,7 @@ active_events = {}
 completed_events = []
 frame_count = 0
 
-print("Scanning frames 1 to 400 for persons, cars, and bicycles...\n")
+print("Scanning frames 1 to 400...\n")
 
 # Extended to frame 400 to capture cars (frame ~210) and bicycles (frame ~330)
 while cap.isOpened() and frame_count < 400:
