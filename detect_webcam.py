@@ -7,7 +7,7 @@ model = YOLO("yolov8n.pt")
 
 # If you pass a filename as an argument (e.g. python3 detect_webcam.py selfie.mp4), it uses it.
 # Otherwise, it defaults to selfie.mp4.
-video_path = sys.argv[1] if len(sys.argv) > 1 else "selfie.mp4"
+video_path = sys.argv[1] if len(sys.argv) > 1 else "walk.mp4"
 cap = cv2.VideoCapture(video_path)
 
 if not cap.isOpened():
