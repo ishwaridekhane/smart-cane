@@ -1,1079 +1,329 @@
-
 import cv2
+import os
 import sys
-import math
 import time
-from collections import deque
+import math
+from collections import defaultdict, deque
 from ultralytics import YOLO
-
-# Optional voice output
-try:
-    import pyttsx3
-    TTS_AVAILABLE = True
-except ImportError:
-    TTS_AVAILABLE = False
-
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
-
 MODEL_PATH = "yolov8n.pt"
-
 video_path = sys.argv[1] if len(sys.argv) > 1 else "street_walk.mp4"
 
-# YOLO
+YOLO_CONFIDENCE = 0.35
 IMG_SIZE = 480
+TRACKER = "bytetrack.yaml"
 
-# Lower than before so small/brief objects such as bicycles
-# have a better chance of being detected.
-CONFIDENCE = 0.30
+NORMAL_SPEECH_COOLDOWN = 3.0
+EMERGENCY_SPEECH_COOLDOWN = 1.0
 
-# Raspberry Pi CPU optimization
-FRAME_SKIP = 2
+GEMINI_MODEL = "gemini-2.5-flash"
+GEMINI_ENABLED = True
+GEMINI_COOLDOWN = 4.0
 
-# Global minimum time between normal announcements
-ALERT_COOLDOWN = 3.0
+IMPORTANT_OBJECTS = {"person", "bicycle", "motorcycle", "car", "bus", "truck"}
+SECONDARY_OBJECTS = {"dog", "chair"}
+ALL_OBJECTS = IMPORTANT_OBJECTS | SECONDARY_OBJECTS
 
-# Emergency can interrupt the cooldown
-EMERGENCY_COOLDOWN = 1.0
-
-# Simple tracking
-MAX_TRACK_DISTANCE = 120
-MAX_TRACK_AGE = 1.5
-
-# A detection must normally be seen this many times
-# before becoming a stable object.
-MIN_CONFIRMATIONS = 2
-
-# Objects that are detected only briefly can still be announced
-# if YOLO is reasonably confident.
-TRANSIENT_CONFIDENCE = 0.55
-
-# Proximity
-NEAR_RATIO = 0.35
-
-# Direction boundaries
-LEFT_BOUNDARY = 0.35
-RIGHT_BOUNDARY = 0.65
-
-# Dead-band around boundaries
-HYSTERESIS_RATIO = 0.05
-
-# Recent movement history
-MOVEMENT_HISTORY = 6
-
-# Only describe objects that are relevant to the user.
-ALLOWED_OBSTACLES = {
-    "person",
-    "bicycle",
-    "car",
-    "motorcycle",
-    "bus",
-    "truck",
-    "dog",
-    "chair"
+AVERAGE_OBJECT_WIDTH_METERS = {
+    "person": 0.45, "bicycle": 0.60, "motorcycle": 0.80,
+    "car": 1.80, "bus": 2.50, "truck": 2.50, "dog": 0.40, "chair": 0.50,
 }
+APPROX_FOCAL_LENGTH_PIXELS = 700.0
 
+def speak(text):
+    print(f"\n[ASSISTANT AUDIO]: {text}\n")
 
 # ============================================================
-# MODEL
+# GEMINI CLIENT INITIALIZATION
 # ============================================================
+gemini_client = None
+if GEMINI_ENABLED:
+    try:
+        from google import genai
+        api_key = os.getenv("GEMINI_API_KEY")
+        if api_key:
+            gemini_client = genai.Client(api_key=api_key)
+            print("[SYSTEM] Gemini GenAI Engine: ENABLED")
+        else:
+            print("[SYSTEM] Gemini GenAI: DISABLED (GEMINI_API_KEY not set)")
+    except Exception as e:
+        print(f"[SYSTEM] Gemini setup error: {e}")
 
+# ============================================================
+# YOLO MODEL & VIDEO SOURCE
+# ============================================================
+print(f"[SYSTEM] Loading YOLOv8 and opening '{video_path}'...")
 model = YOLO(MODEL_PATH)
-
-
-# ============================================================
-# VIDEO
-# ============================================================
-
 cap = cv2.VideoCapture(video_path)
 
 if not cap.isOpened():
-    print(f"Error: Cannot open '{video_path}'.")
+    print(f"Error: Cannot open video input '{video_path}'.")
     sys.exit(1)
 
-
-fps = cap.get(cv2.CAP_PROP_FPS)
-
-if not fps or fps <= 0:
-    fps = 30.0
-
-frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
-frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
-
+fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+frame_width = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
+frame_height = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT))
 
 # ============================================================
-# BOUNDARIES
+# STATE TRACKING
 # ============================================================
+previous_scene = []
+last_speech_time = 0.0
+last_emergency_time = 0.0
+last_gemini_time = 0.0
+last_message = ""
+running_time = 0.0
 
-b1 = frame_w * LEFT_BOUNDARY
-b2 = frame_w * RIGHT_BOUNDARY
-
-hysteresis_margin = frame_w * HYSTERESIS_RATIO
-
-
-# ============================================================
-# OPTIONAL TEXT TO SPEECH
-# ============================================================
-
-speech_engine = None
-
-if TTS_AVAILABLE:
-
-    try:
-        speech_engine = pyttsx3.init()
-
-        speech_engine.setProperty("rate", 165)
-
-    except Exception:
-        speech_engine = None
-
-
-def speak(message):
-    """
-    Speak the assistant message if pyttsx3 is available.
-    Console output always happens.
-    """
-
-    print(message)
-
-    if speech_engine is not None:
-
-        try:
-            speech_engine.say(message)
-            speech_engine.runAndWait()
-
-        except Exception:
-            pass
-
-
-# ============================================================
-# TRACK STORAGE
-# ============================================================
-
-tracks = {}
-
-next_track_id = 1
-
-
-# ============================================================
-# ALERT STATE
-# ============================================================
-
-last_alert_time = -10.0
-last_alert_message = ""
-
-last_emergency_time = -10.0
+track_history = defaultdict(lambda: deque(maxlen=8))
+track_first_seen = {}
+track_last_seen = {}
 
 timeline_records = []
 
-
-# ============================================================
-# HELPER FUNCTIONS
-# ============================================================
-
 def format_time(seconds):
+    return f"{int(seconds // 60):02d}:{int(seconds % 60):02d}"
 
-    return (
-        f"{int(seconds // 60):02d}:"
-        f"{int(seconds % 60):02d}"
-    )
+def center_of_box(x1, y1, x2, y2):
+    return ((x1 + x2) / 2.0, (y1 + y2) / 2.0)
 
+def calculate_distance(label, box_width):
+    if label not in AVERAGE_OBJECT_WIDTH_METERS or box_width <= 5:
+        return None
+    real_w = AVERAGE_OBJECT_WIDTH_METERS[label]
+    dist = (real_w * APPROX_FOCAL_LENGTH_PIXELS) / box_width
+    return max(0.3, min(30.0, dist))
 
-def distance(x1, y1, x2, y2):
+def format_distance(dist):
+    if dist is None:
+        return None
+    if dist < 1.0:
+        return "less than one meter"
+    if dist < 10.0:
+        return f"about {round(dist)} meters"
+    return f"about {round(dist / 5) * 5} meters"
 
-    return math.sqrt(
-        (x2 - x1) ** 2 +
-        (y2 - y1) ** 2
-    )
-
-
-def get_zone(track):
-
-    x = track["x"]
-
-    previous_zone = track["zone"]
-
-
-    # --------------------------------------------------------
-    # First state
-    # --------------------------------------------------------
-
-    if previous_zone is None:
-
-        if x < b1:
-            return "left"
-
-        if x > b2:
-            return "right"
-
-        return "center"
-
-
-    # --------------------------------------------------------
-    # Hysteresis
-    # --------------------------------------------------------
-
-    if previous_zone == "left":
-
-        if x < b1 + hysteresis_margin:
-            return "left"
-
-        if x > b2:
-            return "right"
-
-        return "center"
-
-
-    if previous_zone == "center":
-
-        if x < b1 - hysteresis_margin:
-            return "left"
-
-        if x > b2 + hysteresis_margin:
-            return "right"
-
-        return "center"
-
-
-    # Previous = right
-
-    if x > b2 - hysteresis_margin:
-        return "right"
-
-    if x < b1:
+def get_zone(x_center):
+    ratio = x_center / frame_width
+    if ratio < 0.35:
         return "left"
-
+    elif ratio > 0.65:
+        return "right"
     return "center"
 
-
-def get_movement(track):
-
-    history = track["history"]
-
+def calculate_motion(history):
     if len(history) < 3:
-        return "moving straight ahead"
+        return "moving ahead"
+    old = history[0]
+    new = history[-1]
+    dx = new["x"] - old["x"]
+    dw = new["width"] - old["width"]
+    thresh = frame_width * 0.025
 
+    h_move = "right" if dx > thresh else ("left" if dx < -thresh else None)
+    v_move = "approaching" if dw > thresh else ("moving away" if dw < -thresh else None)
 
-    old_x, old_h = history[0]
-    new_x, new_h = history[-1]
+    if h_move and v_move:
+        return f"moving toward your {h_move} and {v_move}"
+    if h_move:
+        return f"moving toward your {h_move}"
+    if v_move:
+        return v_move
+    return "moving ahead"
 
-
-    dx = new_x - old_x
-    dh = new_h - old_h
-
-
-    # Horizontal movement
-    horizontal_threshold = frame_w * 0.025
-
-
-    if dx > horizontal_threshold:
-
-        horizontal = "toward your right"
-
-    elif dx < -horizontal_threshold:
-
-        horizontal = "toward your left"
-
-    else:
-
-        horizontal = None
-
-
-    # Object getting larger = approaching
-    if dh > 0.08:
-
-        depth = "approaching"
-
-    elif dh < -0.08:
-
-        depth = "moving away"
-
-    else:
-
-        depth = None
-
-
-    if horizontal and depth:
-
-        return f"{depth}, moving {horizontal}"
-
-    if horizontal:
-
-        return f"moving {horizontal}"
-
-    if depth:
-
-        return depth
-
-    return "moving straight ahead"
-
-
-def get_proximity(box_height):
-
-    ratio = box_height / frame_h
-
-    if ratio > NEAR_RATIO:
-        return "near"
-
-    return "far"
-
-
-def object_name(label, count):
-
+def natural_count(label, count):
     if label == "person":
+        return "one person" if count == 1 else (f"two people" if count == 2 else f"{count} people")
+    return f"one {label}" if count == 1 else f"{count} {label}s"
 
-        if count == 1:
-            return "person"
-
-        return "people"
-
-    if count == 1:
-        return label
-
-    return label + "s"
-
-
-def describe_count(label, count):
-
-    if label == "person":
-
-        if count == 1:
-            return "one person"
-
-        if count == 2:
-            return "two people"
-
-        return f"{count} people"
-
-
-    if count == 1:
-        return f"one {label}"
-
-    return f"{count} {label}s"
-
-
-def build_object_description(track_group):
-
-    """
-    Create natural language describing a group of similar objects.
-    """
-
-    if not track_group:
-        return ""
-
-
-    label = track_group[0]["label"]
-
-    count = len(track_group)
-
-    count_text = describe_count(label, count)
-
-
-    # Use the most important/nearest track
-    best_track = sorted(
-        track_group,
-        key=lambda t: (
-            t["proximity"] == "near",
-            t["box_height"]
-        ),
-        reverse=True
-    )[0]
-
-
-    zone = best_track["zone"]
-
-    movement = get_movement(best_track)
-
-
-    # --------------------------------------------------------
-    # Location wording
-    # --------------------------------------------------------
-
+def object_priority(obj):
+    label = obj["label"]
+    zone = obj["zone"]
+    motion = obj["motion"]
+    dist = obj["distance"]
+    score = 50 if label in {"car", "motorcycle", "bus", "truck"} else (40 if label == "bicycle" else (25 if label == "person" else 5))
     if zone == "center":
-
-        location = "ahead of you"
-
-    elif zone == "left":
-
-        location = "on your left"
-
-    else:
-
-        location = "on your right"
-
-
-    # --------------------------------------------------------
-    # Proximity
-    # --------------------------------------------------------
-
-    if best_track["proximity"] == "near":
-
-        if zone == "center":
-
-            return (
-                f"Be careful. {count_text} "
-                f"is very close ahead of you, "
-                f"{movement}."
-            )
-
-        return (
-            f"Be careful. {count_text} "
-            f"is close {location}, "
-            f"{movement}."
-        )
-
-
-    # --------------------------------------------------------
-    # Normal scene description
-    # --------------------------------------------------------
-
-    if zone == "center":
-
-        return (
-            f"There {'is' if count == 1 else 'are'} "
-            f"{count_text} {location}, "
-            f"{movement}."
-        )
-
-
-    return (
-        f"There {'is' if count == 1 else 'are'} "
-        f"{count_text} {location}, "
-        f"{movement}."
-    )
-
-
-# ============================================================
-# TRACK MATCHING
-# ============================================================
-
-def match_detections(detections, current_sec):
-
-    global next_track_id
-
-    matched_track_ids = set()
-
-
-    # --------------------------------------------------------
-    # Match each detection to nearest existing track
-    # --------------------------------------------------------
-
-    for detection in detections:
-
-        label = detection["label"]
-
-        x = detection["x"]
-        y = detection["y"]
-
-
-        best_id = None
-        best_distance = float("inf")
-
-
-        for track_id, track in tracks.items():
-
-            if track_id in matched_track_ids:
-                continue
-
-            if track["label"] != label:
-                continue
-
-
-            age = current_sec - track["last_seen"]
-
-            if age > MAX_TRACK_AGE:
-                continue
-
-
-            d = distance(
-                x,
-                y,
-                track["x"],
-                track["y"]
-            )
-
-
-            if d < best_distance:
-
-                best_distance = d
-                best_id = track_id
-
-
-        # ----------------------------------------------------
-        # Existing object
-        # ----------------------------------------------------
-
-        if (
-            best_id is not None
-            and best_distance <= MAX_TRACK_DISTANCE
-        ):
-
-            track = tracks[best_id]
-
-
-            track["x"] = x
-            track["y"] = y
-
-            track["box_height"] = detection["box_height"]
-
-            track["confidence"] = detection["confidence"]
-
-            track["last_seen"] = current_sec
-
-            track["frames_seen"] += 1
-
-
-            track["history"].append(
-                (
-                    x,
-                    detection["box_height"]
-                )
-            )
-
-
-            track["zone"] = get_zone(track)
-
-            track["proximity"] = get_proximity(
-                detection["box_height"]
-            )
-
-
-            matched_track_ids.add(best_id)
-
-
-        # ----------------------------------------------------
-        # New object
-        # ----------------------------------------------------
-
-        else:
-
-            track_id = next_track_id
-
-            next_track_id += 1
-
-
-            new_track = {
-
-                "id": track_id,
-
-                "label": label,
-
-                "x": x,
-
-                "y": y,
-
-                "box_height":
-                    detection["box_height"],
-
-                "confidence":
-                    detection["confidence"],
-
-                "first_seen":
-                    current_sec,
-
-                "last_seen":
-                    current_sec,
-
-                "frames_seen": 1,
-
-                "history":
-                    deque(
-                        [
-                            (
-                                x,
-                                detection["box_height"]
-                            )
-                        ],
-                        maxlen=MOVEMENT_HISTORY
-                    ),
-
-                "zone": None,
-
-                "proximity":
-                    get_proximity(
-                        detection["box_height"]
-                    ),
-
-                "announced": False
-            }
-
-
-            new_track["zone"] = get_zone(
-                new_track
-            )
-
-
-            tracks[track_id] = new_track
-
-            matched_track_ids.add(track_id)
-
-
-    # --------------------------------------------------------
-    # Delete old tracks
-    # --------------------------------------------------------
-
-    expired_ids = []
-
-    for track_id, track in tracks.items():
-
-        if (
-            current_sec - track["last_seen"]
-            > MAX_TRACK_AGE
-        ):
-
-            expired_ids.append(track_id)
-
-
-    for track_id in expired_ids:
-
-        del tracks[track_id]
-
-
-# ============================================================
-# FIND IMPORTANT NEW OBJECTS
-# ============================================================
-
-def find_new_relevant_tracks(current_sec):
-
-    new_objects = []
-
-
-    for track in tracks.values():
-
-        age = current_sec - track["last_seen"]
-
-        if age > 0.3:
+        score += 30
+    if "approaching" in motion:
+        score += 30
+    if dist and dist < 3.0:
+        score += 40
+    elif dist and dist < 6.0:
+        score += 25
+    return score
+
+def extract_scene(result):
+    objects = []
+    boxes = result.boxes
+    if boxes is None or len(boxes) == 0 or not boxes.is_track or boxes.id is None:
+        return objects
+
+    xyxy = boxes.xyxy.cpu().tolist()
+    classes = boxes.cls.cpu().tolist()
+    confs = boxes.conf.cpu().tolist()
+    track_ids = boxes.id.int().cpu().tolist()
+
+    for box, cls, conf, track_id in zip(xyxy, classes, confs, track_ids):
+        label = model.names[int(cls)]
+        if label not in ALL_OBJECTS:
             continue
 
+        x1, y1, x2, y2 = box
+        xc, yc = center_of_box(x1, y1, x2, y2)
+        w, h = (x2 - x1), (y2 - y1)
 
-        # Stable detection
-        confirmed = (
-            track["frames_seen"]
-            >= MIN_CONFIRMATIONS
-        )
+        track_history[track_id].append({"x": xc, "y": yc, "width": w, "height": h})
+        dist = calculate_distance(label, w)
+        motion = calculate_motion(track_history[track_id])
 
+        obj = {
+            "track_id": int(track_id),
+            "label": label,
+            "confidence": float(conf),
+            "zone": get_zone(xc),
+            "motion": motion,
+            "distance": dist,
+            "distance_text": format_distance(dist),
+        }
+        obj["priority"] = object_priority(obj)
+        objects.append(obj)
+    return objects
 
-        # Brief but high-confidence detection
-        transient = (
-            track["confidence"]
-            >= TRANSIENT_CONFIDENCE
-        )
+def is_relevant(obj):
+    label, zone, motion, dist = obj["label"], obj["zone"], obj["motion"], obj["distance"]
+    if label in {"car", "motorcycle", "bus", "truck"}:
+        return zone == "center" or "approaching" in motion or (dist and dist < 6.0)
+    if label == "bicycle":
+        return True
+    if label == "person":
+        return zone == "center" or "approaching" in motion or (dist and dist < 4.0)
+    return False
 
+def build_basic_description(important_objects):
+    if not important_objects:
+        return None
+    top = important_objects[0]
+    count = sum(1 for o in important_objects if o["label"] == top["label"] and o["zone"] == top["zone"])
+    item_str = natural_count(top["label"], count)
 
-        if not track["announced"] and (
-            confirmed or transient
-        ):
+    if top["zone"] == "center":
+        dist_str = f" {top['distance_text']}" if top["distance_text"] else ""
+        return f"Careful, {item_str} ahead of you{dist_str}, {top['motion']}."
+    return f"{item_str.capitalize()} on your {top['zone']}, {top['motion']}."
 
-            new_objects.append(track)
+def ask_gemini(frame, important_objects):
+    global last_gemini_time
+    if gemini_client is None:
+        return None
+    now = time.time()
+    if now - last_gemini_time < GEMINI_COOLDOWN:
+        return None
+    last_gemini_time = now
 
-
-    return new_objects
-
-
-# ============================================================
-# FIND CURRENT SCENE
-# ============================================================
-
-def get_current_scene(current_sec):
-
-    visible = []
-
-
-    for track in tracks.values():
-
-        age = current_sec - track["last_seen"]
-
-
-        if age <= 0.5:
-
-            visible.append(track)
-
-
-    return visible
-
-
-# ============================================================
-# CREATE ASSISTANT MESSAGE
-# ============================================================
-
-def create_assistant_message(new_objects, visible_objects):
-
-    # --------------------------------------------------------
-    # NEW OBJECT HAS PRIORITY
-    # --------------------------------------------------------
-
-    if new_objects:
-
-        # Group new objects by label
-        grouped = {}
-
-        for track in new_objects:
-
-            grouped.setdefault(
-                track["label"],
-                []
-            ).append(track)
-
-
-        descriptions = []
-
-        for group in grouped.values():
-
-            descriptions.append(
-                build_object_description(group)
-            )
-
-
-        if len(descriptions) == 1:
-
-            return descriptions[0]
-
-
-        return " ".join(descriptions)
-
-
-    # --------------------------------------------------------
-    # Otherwise describe the important current scene
-    # --------------------------------------------------------
-
-    if not visible_objects:
-
+    small_frame = cv2.resize(frame, (480, 360))
+    success, encoded = cv2.imencode(".jpg", small_frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
+    if not success:
         return None
 
+    prompt = f"""
+You are the voice assistant for Sahayak Drishti smart cane.
+The user is visually impaired. Summarize this immediate safety scene in 1 calm, concise sentence:
+Objects: {[{'type': o['label'], 'zone': o['zone'], 'dist': o['distance_text'], 'motion': o['motion']} for o in important_objects]}
+Never invent objects or numbers. Only describe what is in the structured data.
+"""
+    try:
+        from google.genai import types
+        response = gemini_client.models.generate_content(
+            model=GEMINI_MODEL,
+            contents=[types.Part.from_bytes(data=encoded.tobytes(), mime_type="image/jpeg"), prompt],
+            config=types.GenerateContentConfig(temperature=0.1, max_output_tokens=60)
+        )
+        if response.text and response.text.strip().upper() != "SILENT":
+            return response.text.strip().replace("\n", " ")
+    except Exception:
+        pass
+    return None
 
-    # Find nearest object
-    important = sorted(
-        visible_objects,
-        key=lambda t: (
-            t["proximity"] == "near",
-            t["zone"] == "center",
-            t["box_height"]
-        ),
-        reverse=True
-    )
-
-
-    best = important[0]
-
-
-    # Only create a description if movement is meaningful
-    return build_object_description(
-        [best]
-    )
-
-
-# ============================================================
-# START
-# ============================================================
-
-print()
-print("=" * 60)
-print("          SAHAYAK DRISHTI - ASSISTIVE VISION")
-print("=" * 60)
-
-print(f"Video: {video_path}")
-print(f"YOLO confidence: {CONFIDENCE}")
-print(f"Frame skip: {FRAME_SKIP}")
-print(f"Alert cooldown: {ALERT_COOLDOWN}s")
-
-if speech_engine is not None:
-    print("Voice assistant: ENABLED")
-else:
-    print("Voice assistant: console only")
-
-print("=" * 60)
-print()
-
+def is_emergency(objects):
+    for obj in objects:
+        if obj["zone"] == "center":
+            if obj["label"] in {"car", "motorcycle", "bus", "truck"} and (obj["distance"] is None or obj["distance"] < 5.0):
+                return True
+            if obj["label"] == "person" and obj["distance"] and obj["distance"] < 2.0:
+                return True
+    return False
 
 # ============================================================
-# MAIN LOOP
+# MAIN INFERENCE LOOP
 # ============================================================
-
 frame_count = 0
 
-
-while cap.isOpened():
-
-    ret, frame = cap.read()
-
-    if not ret:
-        break
-
-
-    frame_count += 1
-
-    current_sec = frame_count / fps
-
-
-    # --------------------------------------------------------
-    # Frame skipping
-    # --------------------------------------------------------
-
-    if frame_count % FRAME_SKIP != 0:
-        continue
-
-
-    # ========================================================
-    # YOLO
-    # ========================================================
-
-    results = model(
-        frame,
-        imgsz=IMG_SIZE,
-        conf=CONFIDENCE,
-        verbose=False
-    )
-
-
-    boxes = results[0].boxes
-
-
-    detections = []
-
-
-    if boxes is not None and len(boxes) > 0:
-
-        for box in boxes:
-
-            label = model.names[
-                int(box.cls[0])
-            ]
-
-
-            if label not in ALLOWED_OBSTACLES:
-                continue
-
-
-            confidence = float(
-                box.conf[0]
-            )
-
-
-            x1, y1, x2, y2 = (
-                box.xyxy[0].tolist()
-            )
-
-
-            x_center = (
-                x1 + x2
-            ) / 2.0
-
-
-            y_center = (
-                y1 + y2
-            ) / 2.0
-
-
-            box_height = y2 - y1
-
-
-            detections.append({
-
-                "label": label,
-
-                "x": x_center,
-
-                "y": y_center,
-
-                "box_height":
-                    box_height,
-
-                "confidence":
-                    confidence
-            })
-
-
-    # ========================================================
-    # UPDATE TRACKS
-    # ========================================================
-
-    match_detections(
-        detections,
-        current_sec
-    )
-
-
-    # ========================================================
-    # GET SCENE
-    # ========================================================
-
-    visible_objects = get_current_scene(
-        current_sec
-    )
-
-
-    # ========================================================
-    # NEW OBJECTS
-    # ========================================================
-
-    new_objects = find_new_relevant_tracks(
-        current_sec
-    )
-
-
-    # ========================================================
-    # EMERGENCY CHECK
-    # ========================================================
-
-    emergency_objects = [
-
-        track
-
-        for track in visible_objects
-
-        if (
-            track["zone"] == "center"
-            and track["proximity"] == "near"
-        )
-    ]
-
-
-    emergency_now = len(
-        emergency_objects
-    ) > 0
-
-
-    emergency_allowed = (
-        current_sec - last_emergency_time
-        >= EMERGENCY_COOLDOWN
-    )
-
-
-    # ========================================================
-    # BUILD MESSAGE
-    # ========================================================
-
-    message = create_assistant_message(
-        new_objects,
-        visible_objects
-    )
-
-
-    # ========================================================
-    # ALERT DECISION
-    # ========================================================
-
-    normal_cooldown_expired = (
-        current_sec - last_alert_time
-        >= ALERT_COOLDOWN
-    )
-
-
-    should_alert = False
-
-
-    # --------------------------------------------------------
-    # Emergency
-    # --------------------------------------------------------
-
-    if (
-        emergency_now
-        and emergency_allowed
-    ):
-
-        should_alert = True
-
-        last_emergency_time = current_sec
-
-
-    # --------------------------------------------------------
-    # Normal new object / scene change
-    # --------------------------------------------------------
-
-    elif (
-        message is not None
-        and normal_cooldown_expired
-        and message != last_alert_message
-    ):
-
-        should_alert = True
-
-
-    # ========================================================
-    # ANNOUNCE
-    # ========================================================
-
-    if should_alert:
-
-        timestamp = format_time(
-            current_sec
+try:
+    while cap.isOpened():
+        ret, frame = cap.read()
+        if not ret:
+            break
+
+        frame_count += 1
+        current_sec = frame_count / fps
+
+        # Skip every 2nd frame for CPU speed
+        if frame_count % 2 != 0:
+            continue
+
+        percent = int((frame_count / total_frames) * 100) if total_frames > 0 else 0
+        sys.stdout.write(f"\rAnalyzing: {percent:3d}% ({format_time(current_sec)})")
+        sys.stdout.flush()
+
+        results = model.track(
+            frame,
+            persist=True,
+            tracker=TRACKER,
+            conf=YOLO_CONFIDENCE,
+            imgsz=IMG_SIZE,
+            verbose=False
         )
 
+        objects = extract_scene(results[0])
+        important = sorted([o for o in objects if is_relevant(o)], key=lambda x: x["priority"], reverse=True)
 
-        full_message = (
-            f"[{timestamp}] "
-            f"{message}"
-        )
+        if not important:
+            continue
 
+        emergency = is_emergency(important)
+        now = time.time()
 
-        speak(full_message)
+        allow_emergency = emergency and (now - last_emergency_time >= EMERGENCY_SPEECH_COOLDOWN)
+        allow_normal = (not emergency) and (now - last_speech_time >= NORMAL_SPEECH_COOLDOWN)
 
+        if allow_emergency or allow_normal:
+            desc = ask_gemini(frame, important) or build_basic_description(important)
+            if desc and desc != last_message:
+                timestamp = format_time(current_sec)
+                print(f"\r[{timestamp}] {'[EMERGENCY]' if emergency else '[ALERT]'} {desc}")
+                last_message = desc
+                last_speech_time = now
+                if emergency:
+                    last_emergency_time = now
 
-        last_alert_time = current_sec
+                timeline_records.append({
+                    "time": timestamp,
+                    "hazard": desc,
+                    "type": "EMERGENCY" if emergency else "INFO"
+                })
 
-        last_alert_message = message
+finally:
+    cap.release()
 
-
-        # Mark new objects as announced
-        for track in new_objects:
-
-            track["announced"] = True
-
-
-        timeline_records.append({
-
-            "time": timestamp,
-
-            "message": message,
-
-            "emergency":
-                emergency_now
-
-        })
-
-
-# ============================================================
-# CLEANUP
-# ============================================================
-
-cap.release()
-
-
-# ============================================================
-# FINAL SUMMARY
-# ============================================================
-
-print()
-print("=" * 70)
-print("                 ASSISTIVE SCENE TIMELINE")
-print("=" * 70)
-
-
+print("\n" + "=" * 60)
+print("              ASSISTIVE RUNTIME SUMMARY")
+print("=" * 60)
 if timeline_records:
-
-    for record in timeline_records:
-
-        emergency_text = (
-            " [EMERGENCY]"
-            if record["emergency"]
-            else ""
-        )
-
-
-        print(
-            f"[{record['time']}]"
-            f"{emergency_text} "
-            f"{record['message']}"
-        )
-
-
+    for rec in timeline_records:
+        print(f"[{rec['time']}] {rec['hazard']}")
 else:
-
-    print("No alerts generated.")
-
-
-print("=" * 70)
-print()
-
+    print("Path was clear.")
+print("=" * 60 + "\n")
