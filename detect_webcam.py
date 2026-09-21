@@ -1,4 +1,4 @@
-
+```python
 import cv2
 import sys
 from collections import deque
@@ -13,37 +13,20 @@ MODEL_PATH = "yolov8n.pt"
 
 video_path = sys.argv[1] if len(sys.argv) > 1 else "street_walk.mp4"
 
-# YOLO settings
 IMG_SIZE = 480
 CONFIDENCE = 0.45
 
-# Process every Nth frame to reduce Raspberry Pi CPU load
+# Process every 2nd frame to reduce Raspberry Pi CPU load
 FRAME_SKIP = 2
 
-# ------------------------------------------------------------
-# Temporal smoothing
-# ------------------------------------------------------------
-# Keep approximately 0.75 seconds of processed detections.
+# Keep approximately 0.75 seconds of recent detections
 SMOOTHING_SECONDS = 0.75
 
-# ------------------------------------------------------------
-# Global alert cooldown
-# ------------------------------------------------------------
+# Minimum time between normal alerts
 ALERT_COOLDOWN = 3.0
 
-# ------------------------------------------------------------
 # Directional hysteresis
-# ------------------------------------------------------------
-# Objects must move this many pixels beyond a boundary
-# before changing LEFT <-> CENTER or CENTER <-> RIGHT.
 HYSTERESIS_RATIO = 0.05
-
-# ------------------------------------------------------------
-# Emergency definition
-# ------------------------------------------------------------
-# A NEAR object in CENTER is treated as an immediate hazard.
-# It can interrupt the normal 3-second cooldown once.
-# ------------------------------------------------------------
 
 
 ALLOWED_OBSTACLES = {
@@ -92,16 +75,12 @@ frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH))
 b1 = frame_w * 0.35
 b2 = frame_w * 0.65
 
-# Hysteresis dead-band size
 hysteresis_margin = frame_w * HYSTERESIS_RATIO
 
 
 # ============================================================
-# TEMPORAL BUFFER
+# TEMPORAL SMOOTHING BUFFER
 # ============================================================
-
-# We process every FRAME_SKIP frame.
-# Therefore only processed frames enter the buffer.
 
 processed_fps = max(fps / FRAME_SKIP, 1)
 
@@ -114,7 +93,7 @@ detection_buffer = deque(maxlen=buffer_size)
 
 
 # ============================================================
-# STATE
+# ALERT STATE
 # ============================================================
 
 frame_count = 0
@@ -124,13 +103,8 @@ last_alert_time = -10.0
 
 timeline_records = []
 
-# Used for directional hysteresis.
-# Stores the previous approximate x-position and zone
-# for each obstacle label.
 previous_positions = {}
 
-# Prevents the same emergency from repeatedly interrupting
-# the cooldown.
 emergency_active = False
 
 
@@ -139,12 +113,10 @@ emergency_active = False
 # ============================================================
 
 def format_time(seconds):
-    """Convert seconds into MM:SS format."""
     return f"{int(seconds // 60):02d}:{int(seconds % 60):02d}"
 
 
 def pluralize(label, count):
-    """Create natural obstacle descriptions."""
 
     if count == 1:
         return f"1 {label.capitalize()}"
@@ -156,20 +128,10 @@ def pluralize(label, count):
 
 
 def get_zone_with_hysteresis(label, x_center):
-    """
-    Determine LEFT/CENTER/RIGHT while preventing rapid
-    boundary switching.
-
-    A small dead-band around b1 and b2 prevents an object
-    walking close to a boundary from constantly changing zones.
-    """
 
     previous = previous_positions.get(label)
 
-    # --------------------------------------------------------
-    # First detection of this label
-    # --------------------------------------------------------
-
+    # First detection of this object type
     if previous is None:
 
         if x_center < b1:
@@ -193,13 +155,11 @@ def get_zone_with_hysteresis(label, x_center):
 
 
     # --------------------------------------------------------
-    # LEFT
+    # Previously LEFT
     # --------------------------------------------------------
 
     if previous_zone == "left":
 
-        # Stay LEFT until the object clearly crosses
-        # the boundary + hysteresis margin.
         if x_center < b1 + hysteresis_margin:
             zone = "left"
 
@@ -211,7 +171,7 @@ def get_zone_with_hysteresis(label, x_center):
 
 
     # --------------------------------------------------------
-    # CENTER
+    # Previously CENTER
     # --------------------------------------------------------
 
     elif previous_zone == "center":
@@ -227,13 +187,11 @@ def get_zone_with_hysteresis(label, x_center):
 
 
     # --------------------------------------------------------
-    # RIGHT
+    # Previously RIGHT
     # --------------------------------------------------------
 
     else:
 
-        # Stay RIGHT until the object clearly crosses
-        # the boundary - hysteresis margin.
         if x_center > b2 - hysteresis_margin:
             zone = "right"
 
@@ -253,12 +211,6 @@ def get_zone_with_hysteresis(label, x_center):
 
 
 def build_smoothed_scene(buffer):
-    """
-    Combine the recent detection history.
-
-    Instead of trusting one frame, count how frequently
-    each obstacle state appeared during the smoothing window.
-    """
 
     if not buffer:
         return {}
@@ -279,14 +231,13 @@ def build_smoothed_scene(buffer):
 
     for key, values in combined.items():
 
-        # Median is much more resistant to one-frame
-        # detection failures than a simple average.
         sorted_values = sorted(values)
 
         middle = len(sorted_values) // 2
 
         if len(sorted_values) % 2 == 1:
             median_count = sorted_values[middle]
+
         else:
             median_count = (
                 sorted_values[middle - 1]
@@ -294,7 +245,6 @@ def build_smoothed_scene(buffer):
             ) / 2
 
 
-        # Round to nearest integer.
         median_count = int(round(median_count))
 
         if median_count > 0:
@@ -305,18 +255,9 @@ def build_smoothed_scene(buffer):
 
 
 def choose_top_hazard(scene_counts):
-    """
-    Choose the most important smoothed hazard.
-
-    Priority:
-        1. NEAR
-        2. CENTER
-        3. Larger obstacle count
-    """
 
     if not scene_counts:
         return None
-
 
     sorted_hazards = sorted(
         scene_counts.items(),
@@ -328,19 +269,14 @@ def choose_top_hazard(scene_counts):
         reverse=True
     )
 
-
     (label, zone, proximity), count = sorted_hazards[0]
 
     return label, zone, proximity, count
 
 
 def is_emergency(label, zone, proximity):
-    """
-    Emergency condition:
 
-    Any NEAR obstacle in the CENTER path.
-    """
-
+    # NEAR + CENTER = immediate hazard
     return proximity == "NEAR" and zone == "center"
 
 
@@ -348,12 +284,16 @@ def is_emergency(label, zone, proximity):
 # START
 # ============================================================
 
-print(f"\n[ASSISTIVE CANE] Active on '{video_path}'")
+print()
+print(f"[ASSISTIVE CANE] Active on '{video_path}'")
+
 print(
-    f"[SYSTEM] Temporal smoothing: {SMOOTHING_SECONDS:.2f}s | "
+    f"[SYSTEM] Temporal smoothing: "
+    f"{SMOOTHING_SECONDS:.2f}s | "
     f"Cooldown: {ALERT_COOLDOWN:.1f}s | "
     f"Frame skip: {FRAME_SKIP}"
 )
+
 print()
 
 
@@ -375,7 +315,7 @@ while cap.isOpened():
 
 
     # --------------------------------------------------------
-    # Frame skipping for Raspberry Pi CPU
+    # Process every 2nd frame
     # --------------------------------------------------------
 
     if frame_count % FRAME_SKIP != 0:
@@ -397,7 +337,7 @@ while cap.isOpened():
 
 
     # ========================================================
-    # RAW FRAME DETECTIONS
+    # CURRENT FRAME DETECTIONS
     # ========================================================
 
     scene_counts = {}
@@ -423,14 +363,13 @@ while cap.isOpened():
 
 
             # ------------------------------------------------
-            # Proximity
+            # Estimate proximity
             # ------------------------------------------------
 
-            proximity = (
-                "NEAR"
-                if (box_h / frame_h) > 0.35
-                else "FAR"
-            )
+            if (box_h / frame_h) > 0.35:
+                proximity = "NEAR"
+            else:
+                proximity = "FAR"
 
 
             # ------------------------------------------------
@@ -456,14 +395,14 @@ while cap.isOpened():
 
 
     # ========================================================
-    # ADD CURRENT FRAME TO TEMPORAL BUFFER
+    # ADD FRAME TO SMOOTHING BUFFER
     # ========================================================
 
     detection_buffer.append(scene_counts)
 
 
     # ========================================================
-    # TEMPORAL SMOOTHING
+    # SMOOTH DETECTIONS
     # ========================================================
 
     smoothed_scene = build_smoothed_scene(
@@ -472,7 +411,7 @@ while cap.isOpened():
 
 
     # ========================================================
-    # SELECT MOST IMPORTANT HAZARD
+    # SELECT IMPORTANT HAZARD
     # ========================================================
 
     top_hazard = choose_top_hazard(
@@ -499,7 +438,7 @@ while cap.isOpened():
 
 
     # ========================================================
-    # BUILD ALERT MESSAGE
+    # CREATE ALERT MESSAGE
     # ========================================================
 
     if top_proximity == "NEAR":
@@ -518,7 +457,7 @@ while cap.isOpened():
 
 
     # ========================================================
-    # EMERGENCY DETECTION
+    # CHECK EMERGENCY
     # ========================================================
 
     current_emergency = is_emergency(
@@ -528,16 +467,8 @@ while cap.isOpened():
     )
 
 
-    # --------------------------------------------------------
-    # Emergency transition:
-    #
-    # FALSE -> TRUE
-    #
-    # This means a new NEAR CENTER hazard has appeared.
-    #
-    # It may interrupt the 3-second cooldown.
-    # --------------------------------------------------------
-
+    # Only trigger emergency when it changes
+    # from FALSE -> TRUE
     new_emergency = (
         current_emergency
         and not emergency_active
@@ -548,7 +479,7 @@ while cap.isOpened():
 
 
     # ========================================================
-    # GLOBAL ALERT COOLDOWN
+    # GLOBAL COOLDOWN
     # ========================================================
 
     cooldown_expired = (
@@ -558,30 +489,20 @@ while cap.isOpened():
 
 
     # ========================================================
-    # DECIDE WHETHER TO SPEAK / PRINT
+    # DECIDE WHETHER TO ALERT
     # ========================================================
 
     should_alert = False
 
 
-    # --------------------------------------------------------
-    # Emergency gets priority.
-    # --------------------------------------------------------
-
+    # New immediate emergency
     if new_emergency:
 
         should_alert = True
 
 
-    # --------------------------------------------------------
-    # Normal alerts require BOTH:
-    #
-    # 1. Message changed
-    # 2. 3-second cooldown expired
-    #
-    # This is the critical fix for your original spam bug.
-    # --------------------------------------------------------
-
+    # Normal alert:
+    # BOTH conditions must be true.
     elif (
         current_msg != last_alert_message
         and cooldown_expired
@@ -591,7 +512,7 @@ while cap.isOpened():
 
 
     # ========================================================
-    # OUTPUT ALERT
+    # PRINT ALERT
     # ========================================================
 
     if should_alert:
@@ -628,10 +549,11 @@ cap.release()
 
 
 # ============================================================
-# FINAL TIMELINE
+# FINAL SUMMARY
 # ============================================================
 
-print("\n" + "=" * 60)
+print()
+print("=" * 60)
 print("              ASSISTIVE OBSTACLE TIMELINE")
 print("=" * 60)
 
