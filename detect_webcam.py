@@ -34,7 +34,6 @@ ALLOWED_OBSTACLES = {
     "person", "bicycle", "car", "motorcycle", "bus", "truck", "dog", "chair"
 }
 
-# Average physical widths in meters for monocular distance approximation
 AVERAGE_WIDTHS = {
     "person": 0.45, "bicycle": 0.60, "motorcycle": 0.80,
     "car": 1.80, "bus": 2.50, "truck": 2.50, "dog": 0.40, "chair": 0.50
@@ -51,11 +50,11 @@ if api_key:
     try:
         from google import genai
         gemini_client = genai.Client(api_key=api_key)
-        print("[SYSTEM] Gemini GenAI Engine: ENABLED")
+        print("\n[SYSTEM] Gemini GenAI Engine: ENABLED\n")
     except Exception as e:
-        print(f"[SYSTEM] Gemini setup warning: {e}")
+        print(f"\n[SYSTEM] Gemini setup warning: {e}\n")
 else:
-    print("[SYSTEM] Gemini GenAI: DISABLED (GEMINI_API_KEY environment variable not set)")
+    print("\n[SYSTEM] Gemini GenAI: DISABLED (GEMINI_API_KEY not set)\n")
 
 # ============================================================
 # INITIALIZATION
@@ -97,7 +96,6 @@ def estimate_distance_meters(label, box_w):
         return None
     raw_dist = (AVERAGE_WIDTHS[label] * APPROX_FOCAL_LENGTH_PIXELS) / box_w
     raw_dist = max(0.5, min(25.0, raw_dist))
-    # Round to stable intervals to stop single-meter flickering
     if raw_dist < 1.5:
         return 1
     elif raw_dist < 3.5:
@@ -163,7 +161,6 @@ def ask_gemini(frame, detected_info):
 
     try:
         from google.genai import types
-        # Downscale frame for quick network upload
         small_frame = cv2.resize(frame, (320, 240))
         _, encoded = cv2.imencode(".jpg", small_frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
 
@@ -236,8 +233,10 @@ def match_detections(detections, current_sec):
     for t_id in [k for k, v in tracks.items() if current_sec - v["last_seen"] > MAX_TRACK_AGE]:
         del tracks[t_id]
 
-print(f"\n[SAHAYAK DRISHTI] Vision Engine Started: '{video_path}'")
-print(f"[SYSTEM] Duration: {format_time(total_duration_sec)} | High-speed ARM Mode\n")
+print("=" * 68)
+print(f" [SAHAYAK DRISHTI] Vision Engine Running: '{video_path}'")
+print(f" [SYSTEM] Duration: {format_time(total_duration_sec)} | High-speed ARM Mode")
+print("=" * 68 + "\n")
 
 # ============================================================
 # MAIN INFERENCE LOOP
@@ -311,7 +310,6 @@ while cap.isOpened():
         timestamp = format_time(current_sec)
         location = "ahead of you" if lead["zone"] == "center" else f"on your {lead['zone']}"
 
-        # 1. Attempt natural-language verification via Gemini
         detected_context = {
             "obstacle": phrase,
             "location": location,
@@ -321,7 +319,6 @@ while cap.isOpened():
         }
         gemini_msg = ask_gemini(frame, detected_context)
 
-        # 2. Deterministic fallback if Gemini is offline or rate-limited
         if gemini_msg:
             msg = f"[{'EMERGENCY' if emergency_now else 'ALERT'}] {gemini_msg}"
         else:
@@ -332,7 +329,10 @@ while cap.isOpened():
                 be_verb = "is" if count == 1 else "are"
                 msg = f"[ALERT] There {be_verb} {phrase} {location}{dist_clause}, {movement}."
 
-        sys.stdout.write(f"\r{' '*85}\r[{timestamp}] {msg}\n")
+        # Extra line space around each alert for clarity
+        sys.stdout.write(f"\r{' '*85}\r\n[{timestamp}] {msg}\n\n")
+        sys.stdout.flush()
+
         last_alert_time = current_sec
         last_alert_summary = state_signature
 
@@ -343,12 +343,12 @@ while cap.isOpened():
 
 cap.release()
 
-print("\n" + "=" * 65)
-print("                 ASSISTIVE SCENE SUMMARY")
-print("=" * 65)
+print("\n\n" + "=" * 68)
+print("                   ASSISTIVE SCENE SUMMARY")
+print("=" * 68 + "\n")
 if timeline_records:
     for rec in timeline_records:
-        print(f"[{rec['time']}] {rec['message']}")
+        print(f" [{rec['time']}] {rec['message']}\n")
 else:
-    print("Path remained clear throughout navigation.")
-print("=" * 65 + "\n")
+    print(" Path remained clear throughout navigation.\n")
+print("=" * 68 + "\n")
