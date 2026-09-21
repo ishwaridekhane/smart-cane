@@ -20,9 +20,9 @@ b2 = frame_w * 0.65
 
 ALLOWED_OBSTACLES = {'person', 'bicycle', 'car', 'motorcycle', 'bus', 'truck', 'dog', 'chair'}
 
-active_tracks = {}
-next_id = 1
 frame_count = 0
+last_broadcast_msg = ""
+last_broadcast_time = -10.0
 timeline_records = []
 
 def format_time(seconds):
@@ -30,12 +30,19 @@ def format_time(seconds):
 
 def get_zone(x_center):
     if x_center < b1:
-        return "LEFT"
+        return "left"
     elif x_center > b2:
-        return "RIGHT"
-    return "CENTER"
+        return "right"
+    return "center"
 
-print(f"\n[ASSISTIVE CANE ENGINE] Active on '{video_path}'\n")
+def pluralize(label, count):
+    if count == 1:
+        return f"1 {label.capitalize()}"
+    if label == "person":
+        return f"{count} People"
+    return f"{count} {label.capitalize()}s"
+
+print(f"\n[ASSISTIVE CANE] Active on '{video_path}'\n")
 
 while cap.isOpened():
     ret, frame = cap.read()
@@ -45,14 +52,15 @@ while cap.isOpened():
     frame_count += 1
     current_sec = frame_count / fps
 
-    # Skip every 2nd frame for CPU performance
+    # Check every 2nd frame for real-time responsiveness
     if frame_count % 2 != 0:
         continue
 
     results = model(frame, imgsz=480, conf=0.45, verbose=False)
     boxes = results[0].boxes
 
-    detected_items = []
+    # Aggregate counts per (label, zone, proximity)
+    scene_counts = {}
     if boxes is not None and len(boxes) > 0:
         for box in boxes:
             label = model.names[int(box.cls[0])]
@@ -63,86 +71,49 @@ while cap.isOpened():
             x_center = (x1 + x2) / 2.0
             box_h = y2 - y1
 
-            # Proximity estimation based on vertical frame ratio
             proximity = "NEAR" if (box_h / frame_h) > 0.35 else "FAR"
-            detected_items.append((label, x_center, proximity))
+            zone = get_zone(x_center)
 
-    # Match and track
-    matched = set()
-    for label, x_center, proximity in detected_items:
-        best_id = None
-        min_dist = float('inf')
+            key = (label, zone, proximity)
+            scene_counts[key] = scene_counts.get(key, 0) + 1
 
-        for t_id, data in active_tracks.items():
-            if t_id not in matched and data["label"] == label:
-                dist = abs(data["last_x"] - x_center)
-                if dist < 180:
-                    min_dist = dist
-                    best_id = t_id
+    # Select the most critical hazard in the frame (Prioritize NEAR > CENTER path)
+    if scene_counts:
+        sorted_hazards = sorted(
+            scene_counts.items(),
+            key=lambda item: (item[0][2] == "NEAR", item[0][1] == "center"),
+            reverse=True
+        )
+        (top_label, top_zone, top_prox), count = sorted_hazards[0]
 
-        zone = get_zone(x_center)
-
-        if best_id is not None:
-            matched.add(best_id)
-            active_tracks[best_id]["last_seen"] = current_sec
-            active_tracks[best_id]["last_x"] = x_center
-
-            # Alert if an object moves from FAR to NEAR
-            if proximity == "NEAR" and active_tracks[best_id]["proximity"] == "FAR":
-                active_tracks[best_id]["proximity"] = "NEAR"
-                sys.stdout.write(f"\r[{format_time(current_sec)}] [WARNING] {label.capitalize()} approaching close on {zone.lower()}!\n")
-
-            # Alert on major zone change with cooldown
-            elif active_tracks[best_id]["pos"] != zone and (current_sec - active_tracks[best_id]["last_alert_time"] >= 2.5):
-                active_tracks[best_id]["pos"] = zone
-                active_tracks[best_id]["last_alert_time"] = current_sec
-                sys.stdout.write(f"\r[{format_time(current_sec)}] [UPDATE] {label.capitalize()} shifted to {zone.lower()}.\n")
+        phrase_count = pluralize(top_label, count)
+        if top_prox == "NEAR":
+            current_msg = f"[WARNING] Close hazard: {phrase_count} on {top_zone}!"
         else:
-            active_tracks[next_id] = {
-                "label": label,
-                "pos": zone,
-                "proximity": proximity,
-                "start_time": current_sec,
-                "last_seen": current_sec,
-                "last_alert_time": current_sec,
-                "last_x": x_center
-            }
-            # Immediate notification with distance context
-            urgency = "Close hazard:" if proximity == "NEAR" else "Ahead:"
-            sys.stdout.write(f"\r[{format_time(current_sec)}] [ALERT] {urgency} {label.capitalize()} on {zone.lower()}.\n")
-            next_id += 1
+            current_msg = f"[ALERT] Ahead: {phrase_count} on {top_zone}."
 
-    # Prune inactive tracks
-    for t_id in list(active_tracks.keys()):
-        if current_sec - active_tracks[t_id]["last_seen"] > 0.8:
-            data = active_tracks.pop(t_id)
+        # Emit only if the message is different or 3 seconds have passed
+        if current_msg != last_broadcast_msg or (current_sec - last_broadcast_time >= 3.0):
+            print(f"[{format_time(current_sec)}] {current_msg}")
+            last_broadcast_msg = current_msg
+            last_broadcast_time = current_sec
+
             timeline_records.append({
-                "obstacle": data["label"].capitalize(),
-                "position": data["pos"],
-                "proximity": data["proximity"],
-                "start": format_time(data["start_time"]),
-                "end": format_time(data["last_seen"])
+                "hazard": phrase_count,
+                "zone": top_zone.upper(),
+                "time": format_time(current_sec)
             })
-
-for t_id, data in active_tracks.items():
-    timeline_records.append({
-        "obstacle": data["label"].capitalize(),
-        "position": data["pos"],
-        "proximity": data["proximity"],
-        "start": format_time(data["start_time"]),
-        "end": format_time(data["last_seen"])
-    })
 
 cap.release()
 
-print("\n" + "=" * 54)
-print("            ASSISTIVE NAVIGATION SUMMARY")
-print("=" * 54)
+print("\n" + "=" * 46)
+print("          ASSISTIVE OBSTACLE TIMELINE")
+print("=" * 46)
 if timeline_records:
-    print(f"{'Hazard':<12} | {'Proximity':<10} | {'Zone':<8} | {'Window'}")
-    print("-" * 54)
+    print(f"{'Time':<8} | {'Obstacle':<18} | {'Direction'}")
+    print("-" * 46)
     for r in timeline_records:
-        print(f"{r['obstacle']:<12} | {r['proximity']:<10} | {r['position']:<8} | {r['start']} - {r['end']}")
+        print(f"{r['time']:<8} | {r['hazard']:<18} | {r['zone']}")
 else:
-    print("Path completely clear.")
-print("=" * 54 + "\n")
+    print("No critical hazards detected.")
+print("=" * 46 + "\n")
