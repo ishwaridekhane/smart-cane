@@ -31,12 +31,13 @@ HYSTERESIS_RATIO = 0.05
 NEAR_RATIO = 0.35
 
 ALLOWED_OBSTACLES = {
-    "person", "bicycle", "car", "motorcycle", "bus", "truck", "dog", "chair"
+    "person", "bicycle", "car", "motorcycle", "bus", "truck", "dog", "chair", "dining table"
 }
 
 AVERAGE_WIDTHS = {
     "person": 0.45, "bicycle": 0.60, "motorcycle": 0.80,
-    "car": 1.80, "bus": 2.50, "truck": 2.50, "dog": 0.40, "chair": 0.50
+    "car": 1.80, "bus": 2.50, "truck": 2.50, "dog": 0.40, "chair": 0.50,
+    "dining table": 0.90
 }
 APPROX_FOCAL_LENGTH_PIXELS = 700.0
 
@@ -279,12 +280,21 @@ while cap.isOpened():
 
     match_detections(detections, current_sec)
 
-    visible = [t for t in tracks.values() if (current_sec - t["last_seen"] <= 0.4 and t["frames_seen"] >= MIN_CONFIRMATIONS)]
+    # Keep only confirmed objects within roughly 4-5 meters (bounding box height >= 20% of frame)
+    visible = [
+        t for t in tracks.values() 
+        if (current_sec - t["last_seen"] <= 0.4 and t["frames_seen"] >= MIN_CONFIRMATIONS and (t["box_h"] / frame_h) >= 0.20)
+    ]
     if not visible:
         continue
 
-    visible.sort(key=lambda t: (t["proximity"] == "near", t["zone"] == "center", t["box_h"]), reverse=True)
+    # Prioritize obstacles directly in the central walking path
+    visible.sort(key=lambda t: (t["zone"] == "center", t["box_h"]), reverse=True)
     lead = visible[0]
+
+    # Ignore furniture sitting safely on the sides out of the walking lane
+    if lead["label"] in ["chair", "dining table"] and lead["zone"] != "center":
+        continue
 
     emergency_now = (lead["zone"] == "center" and lead["proximity"] == "near")
     emergency_allowed = (current_sec - last_emergency_time >= EMERGENCY_COOLDOWN)
@@ -323,11 +333,11 @@ while cap.isOpened():
             msg = f"[{'EMERGENCY' if emergency_now else 'ALERT'}] {gemini_msg}"
         else:
             dist_clause = f" {dist_str}" if dist_str else ""
+            be_verb = "is" if count == 1 else "are"
             if emergency_now:
-                msg = f"[EMERGENCY] Careful, {phrase} is very close {location}{dist_clause}, {movement}!"
+                msg = f"[EMERGENCY] Careful, {phrase} {be_verb} very close {location}{dist_clause}, {movement}!"
             else:
-                be_verb = "is" if count == 1 else "are"
-                msg = f"[ALERT] There {be_verb} {phrase} {location}{dist_clause}, {movement}."
+                msg = f"[ALERT] Caution, {phrase} {be_verb} {location}{dist_clause}."
 
         # Extra line space around each alert for clarity
         sys.stdout.write(f"\r{' '*85}\r\n[{timestamp}] {msg}\n\n")
