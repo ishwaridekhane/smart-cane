@@ -7,110 +7,34 @@ from collections import deque
 from ultralytics import YOLO
 
 # ============================================================
-# SAHAYAK DRISHTI - ASSISTIVE WALKING VISION ENGINE
-#
-# Main goals:
-#   - Stay quiet when nothing important is happening.
-#   - Say "path is clear" only once when the path becomes clear.
-#   - Focus mainly on the walking path.
-#   - Group people instead of announcing every person separately.
-#   - Detect objects moving into the user's path.
-#   - Detect objects crossing from left/right.
-#   - Avoid repeated irritating announcements.
-#   - Keep local YOLO logic independent from Gemini.
-#
-# Compatible with:
-#   Windows development
-#   Raspberry Pi 4 deployment
-# ============================================================
-
-
-# ============================================================
 # CONFIGURATION
 # ============================================================
 
 MODEL_PATH = "yolov8n.pt"
 
-# Webcam by default.
-# Example:
-#   python detect_webcam.py
-#
-# Video:
-#   python detect_webcam.py street_walk.mp4
-#
-video_source = sys.argv[1] if len(sys.argv) > 1 else 0
-
-
-# ------------------------------------------------------------
-# YOLO PERFORMANCE
-# ------------------------------------------------------------
+video_path = sys.argv[1] if len(sys.argv) > 1 else "street_walk.mp4"
 
 IMG_SIZE = 384
+CONFIDENCE = 0.48
 
-CONFIDENCE = 0.45
-
-# Raspberry Pi 4:
-# Start with 3.
-#
-# If the Pi is very fast, try 2.
-# If the Pi struggles badly, try 4.
 FRAME_SKIP = 3
 
+ALERT_COOLDOWN = 3.5
+EMERGENCY_COOLDOWN = 1.2
+GEMINI_COOLDOWN = 4.0
 
-# ------------------------------------------------------------
-# TRACKING
-# ------------------------------------------------------------
-
-MAX_TRACK_DISTANCE = 120
-
-MAX_TRACK_AGE = 1.2
+MAX_TRACK_DISTANCE = 110
+MAX_TRACK_AGE = 1.0
 
 MIN_CONFIRMATIONS = 3
+MOVEMENT_HISTORY = 6
 
-MOVEMENT_HISTORY = 8
+LEFT_BOUNDARY = 0.35
+RIGHT_BOUNDARY = 0.65
 
+HYSTERESIS_RATIO = 0.05
 
-# ------------------------------------------------------------
-# ANNOUNCEMENT TIMING
-# ------------------------------------------------------------
-
-# Normal messages should not repeat quickly.
-NORMAL_REPEAT_COOLDOWN = 4.0
-
-# Very close obstacle can interrupt normal silence.
-EMERGENCY_COOLDOWN = 1.5
-
-# Gemini should not be called constantly.
-GEMINI_COOLDOWN = 5.0
-
-
-# ------------------------------------------------------------
-# WALKING CORRIDOR
-# ------------------------------------------------------------
-
-LEFT_BOUNDARY = 0.33
-
-RIGHT_BOUNDARY = 0.67
-
-# Prevent an object from jumping between zones
-# because of tiny detection changes.
-HYSTERESIS_RATIO = 0.04
-
-
-# ------------------------------------------------------------
-# OBJECT SIZE / DISTANCE
-# ------------------------------------------------------------
-
-PATH_RELEVANCE_HEIGHT = 0.12
-
-NEAR_RATIO = 0.32
-
-CRITICAL_RATIO = 0.45
-
-
-# ------------------------------------------------------------
-# YOLO COCO OBJECTS WE USE
-# ------------------------------------------------------------
+NEAR_RATIO = 0.35
 
 ALLOWED_OBSTACLES = {
     "person",
@@ -123,14 +47,6 @@ ALLOWED_OBSTACLES = {
     "chair",
     "dining table"
 }
-
-
-# ------------------------------------------------------------
-# APPROXIMATE OBJECT WIDTHS
-#
-# Used only for rough distance estimation.
-# They are NOT accurate measurements.
-# ------------------------------------------------------------
 
 AVERAGE_WIDTHS = {
     "person": 0.45,
@@ -148,7 +64,7 @@ APPROX_FOCAL_LENGTH_PIXELS = 700.0
 
 
 # ============================================================
-# GEMINI SETUP
+# GENAI SETUP (GEMINI)
 # ============================================================
 
 gemini_client = None
@@ -165,7 +81,9 @@ if api_key:
             api_key=api_key
         )
 
-        print("\n[SYSTEM] Gemini GenAI: ENABLED\n")
+        print(
+            "\n[SYSTEM] Gemini GenAI Engine: ENABLED\n"
+        )
 
     except Exception as e:
 
@@ -185,107 +103,63 @@ else:
 # INITIALIZATION
 # ============================================================
 
-try:
+model = YOLO(MODEL_PATH)
 
-    model = YOLO(MODEL_PATH)
-
-except Exception as e:
-
-    print(
-        f"\nERROR: Could not load YOLO model: {e}"
-    )
-
-    sys.exit(1)
-
-
-cap = cv2.VideoCapture(video_source)
+cap = cv2.VideoCapture(video_path)
 
 if not cap.isOpened():
 
     print(
-        f"\nERROR: Cannot open camera/video: "
-        f"{video_source}"
+        f"Error: Cannot open '{video_path}'."
     )
 
     sys.exit(1)
 
 
-# ------------------------------------------------------------
-# CAMERA / VIDEO INFORMATION
-# ------------------------------------------------------------
-
 fps = cap.get(
     cv2.CAP_PROP_FPS
+) or 30.0
+
+total_frames = int(
+    cap.get(cv2.CAP_PROP_FRAME_COUNT)
 )
 
-if fps <= 0:
-
-    fps = 30.0
-
-
-frame_w = int(
-    cap.get(
-        cv2.CAP_PROP_FRAME_WIDTH
-    )
+total_duration_sec = (
+    total_frames / fps
 )
 
 frame_h = int(
-    cap.get(
-        cv2.CAP_PROP_FRAME_HEIGHT
-    )
+    cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
 )
 
-
-if frame_w <= 0:
-
-    frame_w = 640
-
-
-if frame_h <= 0:
-
-    frame_h = 480
-
-
-total_frames = int(
-    cap.get(
-        cv2.CAP_PROP_FRAME_COUNT
-    )
+frame_w = int(
+    cap.get(cv2.CAP_PROP_FRAME_WIDTH)
 )
 
+b1 = (
+    frame_w * LEFT_BOUNDARY
+)
 
-# ============================================================
-# GLOBAL STATE
-# ============================================================
+b2 = (
+    frame_w * RIGHT_BOUNDARY
+)
+
+hysteresis_margin = (
+    frame_w * HYSTERESIS_RATIO
+)
+
 
 tracks = {}
 
 next_track_id = 1
 
-last_announcement_time = -999.0
+last_alert_time = -10.0
 
-last_emergency_time = -999.0
+last_gemini_time = -10.0
 
-last_gemini_time = -999.0
+last_alert_summary = ""
 
-# ------------------------------------------------------------
-# PATH STATE
-# ------------------------------------------------------------
-
-path_was_clear = True
-
-clear_announced = False
-
-
-# ------------------------------------------------------------
-# OBJECT ANNOUNCEMENT MEMORY
-# ------------------------------------------------------------
-
-announced_objects = {}
-
-
-# ------------------------------------------------------------
-# SUMMARY
-# ------------------------------------------------------------
+last_emergency_time = -10.0
 
 timeline_records = []
 
@@ -293,23 +167,18 @@ frame_count = 0
 
 
 # ============================================================
-# HELPER FUNCTIONS
+# FUNCTIONS
 # ============================================================
 
 def format_time(seconds):
 
-    minutes = int(
-        seconds // 60
+    return (
+        f"{int(seconds // 60):02d}:"
+        f"{int(seconds % 60):02d}"
     )
 
-    secs = int(
-        seconds % 60
-    )
 
-    return f"{minutes:02d}:{secs:02d}"
-
-
-def distance_pixels(
+def distance(
     x1,
     y1,
     x2,
@@ -322,137 +191,88 @@ def distance_pixels(
     )
 
 
-# ============================================================
-# ROUGH DISTANCE ESTIMATION
-# ============================================================
-
 def estimate_distance_meters(
     label,
     box_w
 ):
 
-    if label not in AVERAGE_WIDTHS:
+    if (
+        label not in AVERAGE_WIDTHS
+        or box_w <= 5
+    ):
 
         return None
 
-    if box_w <= 5:
 
-        return None
+    raw_dist = (
 
-    raw_distance = (
         AVERAGE_WIDTHS[label]
         * APPROX_FOCAL_LENGTH_PIXELS
+
     ) / box_w
 
-    raw_distance = max(
+
+    raw_dist = max(
         0.5,
-        min(
-            25.0,
-            raw_distance
-        )
+        min(25.0, raw_dist)
     )
 
-    if raw_distance < 1.5:
+
+    if raw_dist < 1.5:
 
         return 1
 
-    elif raw_distance < 3.5:
+    elif raw_dist < 3.5:
 
         return 3
 
-    elif raw_distance < 6.0:
+    elif raw_dist < 6.0:
 
         return 5
 
-    elif raw_distance < 9.0:
+    elif raw_dist < 9.0:
 
         return 8
 
-    else:
-
-        return round(
-            raw_distance / 5.0
-        ) * 5
+    return round(
+        raw_dist / 5.0
+    ) * 5
 
 
 # ============================================================
-# ZONE DETECTION
+# POSITION: LEFT / CENTER / RIGHT
 # ============================================================
 
 def get_zone(
     x,
-    previous_zone=None
+    previous_zone
 ):
-
-    left_boundary = (
-        frame_w * LEFT_BOUNDARY
-    )
-
-    right_boundary = (
-        frame_w * RIGHT_BOUNDARY
-    )
-
-    hysteresis_margin = (
-        frame_w * HYSTERESIS_RATIO
-    )
-
-
-    # --------------------------------------------------------
-    # Previously LEFT
-    # --------------------------------------------------------
 
     if previous_zone == "left":
 
         if x < (
-            left_boundary
-            + hysteresis_margin
+            b1 + hysteresis_margin
         ):
 
             return "left"
 
-        if x > right_boundary:
-
-            return "right"
-
-        return "center"
-
-
-    # --------------------------------------------------------
-    # Previously RIGHT
-    # --------------------------------------------------------
-
-    if previous_zone == "right":
-
-        if x > (
-            right_boundary
-            - hysteresis_margin
-        ):
-
-            return "right"
-
-        if x < left_boundary:
-
-            return "left"
-
-        return "center"
+        return (
+            "right"
+            if x > b2
+            else "center"
+        )
 
 
-    # --------------------------------------------------------
-    # Previously CENTER
-    # --------------------------------------------------------
-
-    if previous_zone == "center":
+    elif previous_zone == "center":
 
         if x < (
-            left_boundary
-            - hysteresis_margin
+            b1 - hysteresis_margin
         ):
 
             return "left"
 
         if x > (
-            right_boundary
-            + hysteresis_margin
+            b2 + hysteresis_margin
         ):
 
             return "right"
@@ -460,1034 +280,156 @@ def get_zone(
         return "center"
 
 
-    # --------------------------------------------------------
-    # NEW OBJECT
-    # --------------------------------------------------------
+    elif previous_zone == "right":
 
-    if x < left_boundary:
+        if x > (
+            b2 - hysteresis_margin
+        ):
 
-        return "left"
+            return "right"
 
-    if x > right_boundary:
+        return (
+            "left"
+            if x < b1
+            else "center"
+        )
 
-        return "right"
 
-    return "center"
+    else:
 
+        if x < b1:
 
-# ============================================================
-# DISTANCE LEVEL
-# ============================================================
+            return "left"
 
-def get_distance_level(track):
+        if x > b2:
 
-    height_ratio = (
-        track["box_h"]
-        / frame_h
-    )
+            return "right"
 
-    if height_ratio >= CRITICAL_RATIO:
-
-        return "critical"
-
-    if height_ratio >= NEAR_RATIO:
-
-        return "near"
-
-    if height_ratio >= 0.20:
-
-        return "medium"
-
-    return "far"
+        return "center"
 
 
 # ============================================================
-# MOVEMENT ANALYSIS
+# MOVEMENT
 # ============================================================
 
-def get_movement(track):
+def get_movement(history):
 
-    history = track["history"]
+    if len(history) < 3:
 
-    if len(history) < 4:
-
-        return "stable"
+        return "moving ahead"
 
 
-    old_x, old_height = history[0]
-
-    new_x, new_height = history[-1]
-
-
-    horizontal_threshold = (
-        frame_w * 0.04
+    dx = (
+        history[-1][0]
+        - history[0][0]
     )
 
-    approaching_threshold = 0.07
-
-
-    dx = new_x - old_x
-
-    dh = new_height - old_height
-
-
-    moving_right = (
-        dx > horizontal_threshold
+    dh = (
+        history[-1][1]
+        - history[0][1]
     )
 
-    moving_left = (
-        dx < -horizontal_threshold
+
+    h_thresh = (
+        frame_w * 0.035
     )
+
+
+    h_move = (
+
+        "to the right"
+
+        if dx > h_thresh
+
+        else (
+
+            "to the left"
+
+            if dx < -h_thresh
+
+            else None
+        )
+    )
+
 
     approaching = (
-        dh > approaching_threshold
+        dh > 0.08
     )
+
+
+    if approaching and h_move:
+
+        return (
+            f"approaching from {h_move}"
+        )
 
 
     if approaching:
 
-        if moving_right:
-
-            return "approaching from the left"
-
-        if moving_left:
-
-            return "approaching from the right"
-
         return "approaching"
 
 
-    if moving_right:
+    if h_move:
 
-        return "moving toward the right"
-
-
-    if moving_left:
-
-        return "moving toward the left"
+        return (
+            f"shifting {h_move}"
+        )
 
 
-    return "stable"
+    return "moving ahead"
 
 
 # ============================================================
-# CROSSING DIRECTION
+# NATURAL OBJECT PHRASE
 # ============================================================
 
-def get_crossing_direction(track):
-
-    history = track["history"]
-
-    if len(history) < 5:
-
-        return None
-
-
-    old_x = history[0][0]
-
-    new_x = history[-1][0]
-
-
-    movement = (
-        new_x - old_x
-    )
-
-    threshold = (
-        frame_w * 0.08
-    )
-
-
-    if movement > threshold:
-
-        return "left to right"
-
-
-    if movement < -threshold:
-
-        return "right to left"
-
-
-    return None
-
-
-# ============================================================
-# NATURAL OBJECT PHRASES
-# ============================================================
-
-def object_phrase(
+def natural_phrase(
     label,
-    count=1
+    count
 ):
 
     if label == "person":
 
-        if count == 1:
-
-            return "one person"
-
-        if count == 2:
-
-            return "two people"
-
-        if count == 3:
-
-            return "three people"
-
         return (
-            f"a group of {count} people"
-        )
 
+            "one person"
 
-    if count == 1:
+            if count == 1
 
-        return f"one {label}"
+            else (
 
+                "two people"
 
-    return f"{count} {label}s"
+                if count == 2
 
-
-# ============================================================
-# TRACKING
-# ============================================================
-
-def match_detections(
-    detections,
-    current_sec
-):
-
-    global next_track_id
-
-    matched_tracks = set()
-
-
-    for detection in detections:
-
-        best_id = None
-
-        best_distance = float("inf")
-
-
-        # ----------------------------------------------------
-        # Find closest existing track
-        # ----------------------------------------------------
-
-        for track_id, track in tracks.items():
-
-            if track_id in matched_tracks:
-
-                continue
-
-
-            if track["label"] != detection["label"]:
-
-                continue
-
-
-            if (
-                current_sec
-                - track["last_seen"]
-                > MAX_TRACK_AGE
-            ):
-
-                continue
-
-
-            d = distance_pixels(
-
-                detection["x"],
-                detection["y"],
-
-                track["x"],
-                track["y"]
+                else f"{count} people"
             )
-
-
-            if d < best_distance:
-
-                best_distance = d
-
-                best_id = track_id
-
-
-        distance_m = estimate_distance_meters(
-
-            detection["label"],
-
-            detection["box_w"]
-        )
-
-
-        # ----------------------------------------------------
-        # Update existing track
-        # ----------------------------------------------------
-
-        if (
-            best_id is not None
-            and best_distance
-            <= MAX_TRACK_DISTANCE
-        ):
-
-            track = tracks[best_id]
-
-
-            track["x"] = (
-                detection["x"]
-            )
-
-            track["y"] = (
-                detection["y"]
-            )
-
-
-            track["box_w"] = (
-                detection["box_w"]
-            )
-
-            track["box_h"] = (
-                detection["box_h"]
-            )
-
-
-            track["x1"] = (
-                detection["x"]
-                - detection["box_w"] / 2
-            )
-
-            track["x2"] = (
-                detection["x"]
-                + detection["box_w"] / 2
-            )
-
-
-            track["dist_m"] = (
-                distance_m
-            )
-
-
-            track["last_seen"] = (
-                current_sec
-            )
-
-
-            track["frames_seen"] += 1
-
-
-            track["history"].append(
-
-                (
-                    detection["x"],
-
-                    detection["box_h"]
-                    / frame_h
-                )
-            )
-
-
-            track["zone"] = get_zone(
-
-                detection["x"],
-
-                track["zone"]
-            )
-
-
-            matched_tracks.add(
-                best_id
-            )
-
-
-        # ----------------------------------------------------
-        # Create new track
-        # ----------------------------------------------------
-
-        else:
-
-            track_id = next_track_id
-
-            next_track_id += 1
-
-
-            initial_zone = get_zone(
-
-                detection["x"]
-            )
-
-
-            tracks[track_id] = {
-
-                "id": track_id,
-
-                "label": detection["label"],
-
-                "x": detection["x"],
-
-                "y": detection["y"],
-
-                "box_w": detection["box_w"],
-
-                "box_h": detection["box_h"],
-
-                "x1": (
-                    detection["x"]
-                    - detection["box_w"] / 2
-                ),
-
-                "x2": (
-                    detection["x"]
-                    + detection["box_w"] / 2
-                ),
-
-                "dist_m": distance_m,
-
-                "first_seen": current_sec,
-
-                "last_seen": current_sec,
-
-                "frames_seen": 1,
-
-                "history": deque(
-
-                    [
-                        (
-                            detection["x"],
-
-                            detection["box_h"]
-                            / frame_h
-                        )
-                    ],
-
-                    maxlen=MOVEMENT_HISTORY
-                ),
-
-                "zone": initial_zone
-            }
-
-
-            matched_tracks.add(
-                track_id
-            )
-
-
-    # --------------------------------------------------------
-    # Remove expired tracks
-    # --------------------------------------------------------
-
-    expired_tracks = [
-
-        track_id
-
-        for track_id, track
-        in tracks.items()
-
-        if (
-            current_sec
-            - track["last_seen"]
-            > MAX_TRACK_AGE
-        )
-    ]
-
-
-    for track_id in expired_tracks:
-
-        del tracks[track_id]
-
-
-# ============================================================
-# GET VISIBLE CONFIRMED OBJECTS
-# ============================================================
-
-def get_visible_tracks(
-    current_sec
-):
-
-    visible = []
-
-
-    for track in tracks.values():
-
-        if (
-            current_sec
-            - track["last_seen"]
-            > 0.5
-        ):
-
-            continue
-
-
-        if (
-            track["frames_seen"]
-            < MIN_CONFIRMATIONS
-        ):
-
-            continue
-
-
-        height_ratio = (
-            track["box_h"]
-            / frame_h
-        )
-
-
-        if (
-            height_ratio
-            < PATH_RELEVANCE_HEIGHT
-        ):
-
-            continue
-
-
-        visible.append(track)
-
-
-    return visible
-
-
-# ============================================================
-# DOES OBJECT BLOCK WALKING PATH?
-#
-# Important:
-# A chair/table on the side may still stick into the
-# walking corridor.
-# ============================================================
-
-def object_blocks_path(track):
-
-    zone = track["zone"]
-
-    height_ratio = (
-        track["box_h"]
-        / frame_h
-    )
-
-
-    # --------------------------------------------------------
-    # Anything in center is relevant.
-    # --------------------------------------------------------
-
-    if zone == "center":
-
-        return True
-
-
-    # --------------------------------------------------------
-    # Check if side object physically extends into
-    # the central walking corridor.
-    # --------------------------------------------------------
-
-    left_boundary = (
-        frame_w * LEFT_BOUNDARY
-    )
-
-    right_boundary = (
-        frame_w * RIGHT_BOUNDARY
-    )
-
-
-    x1 = track.get(
-        "x1",
-        0
-    )
-
-    x2 = track.get(
-        "x2",
-        0
-    )
-
-
-    if (
-        x2 > left_boundary
-        and x1 < right_boundary
-        and height_ratio
-        >= PATH_RELEVANCE_HEIGHT
-    ):
-
-        return True
-
-
-    return False
-
-
-# ============================================================
-# FIND OBJECTS THAT MATTER TO WALKING
-# ============================================================
-
-def find_path_obstacles(
-    visible
-):
-
-    return [
-
-        track
-
-        for track in visible
-
-        if object_blocks_path(track)
-
-    ]
-
-
-# ============================================================
-# DETECT OBJECT ENTERING WALKING PATH
-# ============================================================
-
-def is_entering_path(track):
-
-    history = track["history"]
-
-
-    if len(history) < 5:
-
-        return False
-
-
-    old_x = history[0][0]
-
-    new_x = history[-1][0]
-
-
-    old_zone = get_zone(
-        old_x
-    )
-
-    new_zone = track["zone"]
-
-
-    # Object moved from side into center.
-    if (
-        old_zone != "center"
-        and new_zone == "center"
-    ):
-
-        if (
-            track["box_h"]
-            / frame_h
-            >= 0.14
-        ):
-
-            return True
-
-
-    return False
-
-
-# ============================================================
-# CROSSING MESSAGE
-# ============================================================
-
-def crossing_message(track):
-
-    direction = get_crossing_direction(
-        track
-    )
-
-
-    label = track["label"]
-
-
-    if direction == "left to right":
-
-        return (
-            f"{object_phrase(label)} "
-            f"is crossing from your left to right"
-        )
-
-
-    if direction == "right to left":
-
-        return (
-            f"{object_phrase(label)} "
-            f"is crossing from your right to left"
         )
 
 
     return (
-        f"{object_phrase(label)} "
-        f"is moving across your path"
+
+        f"one {label}"
+
+        if count == 1
+
+        else f"{count} {label}s"
     )
 
 
 # ============================================================
-# BUILD LOCAL ALERT
-#
-# This is the important navigation logic.
-# Gemini does NOT control this logic.
-# ============================================================
-
-def build_alert(
-    obstacles
-):
-
-    if not obstacles:
-
-        return None
-
-
-    # --------------------------------------------------------
-    # 1. OBJECT ENTERING PATH
-    # --------------------------------------------------------
-
-    entering = [
-
-        track
-
-        for track in obstacles
-
-        if is_entering_path(track)
-
-    ]
-
-
-    if entering:
-
-        entering.sort(
-
-            key=lambda x:
-            x["box_h"],
-
-            reverse=True
-        )
-
-
-        lead = entering[0]
-
-
-        return (
-            crossing_message(lead),
-            lead
-        )
-
-
-    # --------------------------------------------------------
-    # 2. VERY CLOSE CENTER OBJECT
-    # --------------------------------------------------------
-
-    critical = [
-
-        track
-
-        for track in obstacles
-
-        if (
-            track["zone"]
-            == "center"
-
-            and get_distance_level(track)
-            == "critical"
-        )
-    ]
-
-
-    if critical:
-
-        critical.sort(
-
-            key=lambda x:
-            x["box_h"],
-
-            reverse=True
-        )
-
-
-        lead = critical[0]
-
-
-        return (
-
-            f"Careful, "
-            f"{object_phrase(lead['label'])} "
-            f"is very close ahead of you",
-
-            lead
-        )
-
-
-    # --------------------------------------------------------
-    # 3. GROUP OF PEOPLE
-    # --------------------------------------------------------
-
-    people = [
-
-        track
-
-        for track in obstacles
-
-        if (
-            track["label"]
-            == "person"
-
-            and track["zone"]
-            == "center"
-        )
-    ]
-
-
-    if len(people) >= 3:
-
-        lead = max(
-
-            people,
-
-            key=lambda x:
-            x["box_h"]
-        )
-
-
-        return (
-
-            f"A group of "
-            f"{len(people)} people "
-            f"is ahead of you",
-
-            lead
-        )
-
-
-    # --------------------------------------------------------
-    # 4. SINGLE / TWO PEOPLE
-    # --------------------------------------------------------
-
-    if people:
-
-        people.sort(
-
-            key=lambda x:
-            x["box_h"],
-
-            reverse=True
-        )
-
-
-        lead = people[0]
-
-
-        if len(people) == 2:
-
-            return (
-                "Two people are ahead of you",
-                lead
-            )
-
-
-        return (
-            "One person is ahead of you",
-            lead
-        )
-
-
-    # --------------------------------------------------------
-    # 5. OTHER CENTER OBJECT
-    # --------------------------------------------------------
-
-    center_objects = [
-
-        track
-
-        for track in obstacles
-
-        if track["zone"] == "center"
-    ]
-
-
-    if center_objects:
-
-        center_objects.sort(
-
-            key=lambda x:
-            x["box_h"],
-
-            reverse=True
-        )
-
-
-        lead = center_objects[0]
-
-
-        label = lead["label"]
-
-
-        level = get_distance_level(
-            lead
-        )
-
-
-        if level == "near":
-
-            return (
-
-                f"{object_phrase(label)} "
-                f"is ahead of you",
-
-                lead
-            )
-
-
-        return (
-
-            f"There is "
-            f"{object_phrase(label)} "
-            f"ahead of you",
-
-            lead
-        )
-
-
-    # --------------------------------------------------------
-    # 6. SIDE OBJECT ONLY IF CLOSE
-    #
-    # We DO NOT constantly announce side objects.
-    # --------------------------------------------------------
-
-    side_objects = [
-
-        track
-
-        for track in obstacles
-
-        if (
-            track["zone"] != "center"
-
-            and get_distance_level(track)
-            in ["near", "critical"]
-        )
-    ]
-
-
-    if side_objects:
-
-        side_objects.sort(
-
-            key=lambda x:
-            x["box_h"],
-
-            reverse=True
-        )
-
-
-        lead = side_objects[0]
-
-
-        return (
-
-            f"{object_phrase(lead['label'])} "
-            f"is close on your "
-            f"{lead['zone']}",
-
-            lead
-        )
-
-
-    return None
-
-
-# ============================================================
-# SHOULD THIS OBJECT BE ANNOUNCED AGAIN?
-# ============================================================
-
-def should_repeat(track):
-
-    object_id = track["id"]
-
-
-    previous = announced_objects.get(
-        object_id
-    )
-
-
-    # New object.
-    if previous is None:
-
-        return True
-
-
-    previous_zone = previous[
-        "zone"
-    ]
-
-    previous_level = previous[
-        "level"
-    ]
-
-
-    current_level = get_distance_level(
-        track
-    )
-
-
-    # --------------------------------------------------------
-    # Became significantly closer.
-    # --------------------------------------------------------
-
-    if (
-        previous_level
-        != current_level
-
-        and current_level
-        in ["near", "critical"]
-    ):
-
-        return True
-
-
-    # --------------------------------------------------------
-    # Moved into center path.
-    # --------------------------------------------------------
-
-    if (
-        previous_zone != "center"
-
-        and track["zone"]
-        == "center"
-    ):
-
-        return True
-
-
-    # --------------------------------------------------------
-    # Otherwise remain quiet.
-    # --------------------------------------------------------
-
-    return False
-
-
-# ============================================================
-# REMEMBER ANNOUNCEMENT
-# ============================================================
-
-def remember_announcement(track):
-
-    announced_objects[
-        track["id"]
-    ] = {
-
-        "zone":
-            track["zone"],
-
-        "level":
-            get_distance_level(track),
-
-        "time":
-            time.time()
-    }
-
-
-# ============================================================
-# GEMINI SCENE DESCRIPTION
-#
-# Gemini is OPTIONAL.
-#
-# Python decides WHEN something is important.
-# Gemini only helps phrase the scene naturally.
+# GEMINI
 # ============================================================
 
 def ask_gemini(
     frame,
-    scene_data
+    detected_info
 ):
 
     global last_gemini_time
 
 
-    if gemini_client is None:
+    if not gemini_client:
 
         return None
 
@@ -1496,8 +438,7 @@ def ask_gemini(
 
 
     if (
-        now
-        - last_gemini_time
+        now - last_gemini_time
         < GEMINI_COOLDOWN
     ):
 
@@ -1510,14 +451,12 @@ def ask_gemini(
 
 
         small_frame = cv2.resize(
-
             frame,
-
             (320, 240)
         )
 
 
-        success, encoded = cv2.imencode(
+        _, encoded = cv2.imencode(
 
             ".jpg",
 
@@ -1530,73 +469,19 @@ def ask_gemini(
         )
 
 
-        if not success:
-
-            return None
-
-
         prompt = f"""
-You are the visual assistant of a smart walking cane
-for a blind person.
+You are the voice of a smart cane for a visually impaired user.
 
-Your job is NOT to narrate everything visible.
+Summarize the key obstacle in 1 concise, calm sentence based only on
+these confirmed detections:
 
-Speak only about what matters for walking.
+{detected_info}
 
-CONFIRMED LOCAL DETECTION INFORMATION:
-{scene_data}
-
-STRICT RULES:
-
-1. Give ONE short, natural spoken sentence.
-
-2. Be calm and useful.
-
-3. Do not repeatedly say left/right.
-
-4. Prioritize objects in the walking path.
-
-5. Prioritize objects entering or crossing the walking path.
-
-6. If several people are together, describe them as a group.
-
-7. If an object is safely away from the walking path,
-   do not mention it.
-
-8. If an object is moving toward the user, mention that
-   only when the movement is supported by the information.
-
-9. Never invent an object.
-
-10. Never invent stairs.
-
-11. Never invent an elevator or lift.
-
-12. Never invent a door.
-
-13. Never invent a curb.
-
-14. Never invent a pothole.
-
-15. Never invent road conditions.
-
-16. Never invent distance.
-
-17. Never give a navigation instruction unless the
-    confirmed information clearly supports it.
-
-18. Do not mention AI.
-
-19. Do not mention YOLO.
-
-20. Do not mention confidence scores.
-
-21. Maximum 18 words.
-
-22. Return ONLY the sentence to speak.
-
-The user should feel as if another person is quietly
-describing only the important things around them.
+Include distance in meters if available.
+Include the object's position if available.
+Do not invent details.
+Do not remove the confirmed position or distance.
+Return only the spoken sentence.
 """
 
 
@@ -1620,7 +505,7 @@ describing only the important things around them.
 
                 temperature=0.1,
 
-                max_output_tokens=50
+                max_output_tokens=40
             )
         )
 
@@ -1631,63 +516,420 @@ describing only the important things around them.
         if response.text:
 
             return (
-
                 response.text
                 .strip()
                 .replace("\n", " ")
             )
 
 
-    except Exception as e:
+    except Exception:
 
-        print(
-            f"\n[GEMINI WARNING] {e}"
-        )
+        pass
 
 
     return None
 
 
 # ============================================================
-# START MESSAGE
+# TRACKING
+# ============================================================
+
+def match_detections(
+    detections,
+    current_sec
+):
+
+    global next_track_id
+
+    matched = set()
+
+
+    for det in detections:
+
+        best_id = None
+
+        min_d = float("inf")
+
+
+        for t_id, trk in tracks.items():
+
+            if (
+                t_id in matched
+                or trk["label"]
+                != det["label"]
+            ):
+
+                continue
+
+
+            if (
+                current_sec
+                - trk["last_seen"]
+                > MAX_TRACK_AGE
+            ):
+
+                continue
+
+
+            d = distance(
+
+                det["x"],
+                det["y"],
+
+                trk["x"],
+                trk["y"]
+            )
+
+
+            if d < min_d:
+
+                min_d = d
+
+                best_id = t_id
+
+
+        dist_m = estimate_distance_meters(
+
+            det["label"],
+
+            det["box_w"]
+        )
+
+
+        # ====================================================
+        # UPDATE EXISTING TRACK
+        # ====================================================
+
+        if (
+
+            best_id is not None
+
+            and min_d
+            <= MAX_TRACK_DISTANCE
+
+        ):
+
+            trk = tracks[best_id]
+
+
+            trk["x"] = det["x"]
+
+            trk["y"] = det["y"]
+
+
+            trk["x1"] = (
+                det["x"]
+                - det["box_w"] / 2
+            )
+
+            trk["x2"] = (
+                det["x"]
+                + det["box_w"] / 2
+            )
+
+
+            trk["box_h"] = (
+                det["box_h"]
+            )
+
+            trk["box_w"] = (
+                det["box_w"]
+            )
+
+
+            trk["dist_m"] = (
+                dist_m
+            )
+
+
+            trk["last_seen"] = (
+                current_sec
+            )
+
+
+            trk["frames_seen"] += 1
+
+
+            trk["history"].append(
+
+                (
+                    det["x"],
+
+                    det["box_h"]
+                    / frame_h
+                )
+            )
+
+
+            trk["zone"] = get_zone(
+
+                det["x"],
+
+                trk["zone"]
+            )
+
+
+            trk["proximity"] = (
+
+                "near"
+
+                if (
+                    det["box_h"]
+                    / frame_h
+                ) > NEAR_RATIO
+
+                else "far"
+            )
+
+
+            matched.add(
+                best_id
+            )
+
+
+        # ====================================================
+        # NEW TRACK
+        # ====================================================
+
+        else:
+
+            t_id = next_track_id
+
+            next_track_id += 1
+
+
+            init_zone = get_zone(
+
+                det["x"],
+
+                None
+            )
+
+
+            tracks[t_id] = {
+
+                "id": t_id,
+
+                "label":
+                    det["label"],
+
+                "x":
+                    det["x"],
+
+                "y":
+                    det["y"],
+
+                "x1":
+                    det["x"]
+                    - det["box_w"] / 2,
+
+                "x2":
+                    det["x"]
+                    + det["box_w"] / 2,
+
+                "box_h":
+                    det["box_h"],
+
+                "box_w":
+                    det["box_w"],
+
+                "dist_m":
+                    dist_m,
+
+                "first_seen":
+                    current_sec,
+
+                "last_seen":
+                    current_sec,
+
+                "frames_seen":
+                    1,
+
+                "history":
+                    deque(
+
+                        [
+                            (
+                                det["x"],
+
+                                det["box_h"]
+                                / frame_h
+                            )
+                        ],
+
+                        maxlen=
+                        MOVEMENT_HISTORY
+                    ),
+
+                "zone":
+                    init_zone,
+
+                "proximity":
+
+                    "near"
+
+                    if (
+                        det["box_h"]
+                        / frame_h
+                    ) > NEAR_RATIO
+
+                    else "far"
+            }
+
+
+            matched.add(
+                t_id
+            )
+
+
+    # ========================================================
+    # REMOVE OLD TRACKS
+    # ========================================================
+
+    for t_id in [
+
+        k
+
+        for k, v
+        in tracks.items()
+
+        if (
+            current_sec
+            - v["last_seen"]
+            > MAX_TRACK_AGE
+        )
+    ]:
+
+        del tracks[t_id]
+
+
+# ============================================================
+# NEW LOGIC:
+# DOES OBJECT ACTUALLY ENTER THE WALKING LANE?
+#
+# This is the main change.
+# ============================================================
+
+def sticks_into_lane(trk):
+
+    # Objects in the center are already in the path.
+    if trk["zone"] == "center":
+
+        return True
+
+
+    # For side objects, check the actual bounding box.
+    # This prevents a chair/table beside the path from being
+    # announced unless it actually extends into the lane.
+
+    x1 = trk.get(
+        "x1",
+        0
+    )
+
+    x2 = trk.get(
+        "x2",
+        0
+    )
+
+
+    # The object overlaps the central walking corridor.
+    overlaps_lane = (
+
+        x2 > b1
+
+        and x1 < b2
+    )
+
+
+    if not overlaps_lane:
+
+        return False
+
+
+    # For chairs/tables, only announce if reasonably close.
+    if trk["label"] in [
+        "chair",
+        "dining table"
+    ]:
+
+        return (
+            trk["proximity"]
+            == "near"
+        )
+
+
+    # People/vehicles/bicycles/dogs etc.
+    # entering the lane should be considered relevant.
+    return True
+
+
+# ============================================================
+# NEW LOGIC:
+# DETECT OBJECT MOVING FROM SIDE INTO CENTER
+# ============================================================
+
+def entering_center(trk):
+
+    history = trk["history"]
+
+
+    if len(history) < 4:
+
+        return False
+
+
+    old_x = history[0][0]
+
+    new_x = history[-1][0]
+
+
+    old_zone = get_zone(
+        old_x,
+        None
+    )
+
+    new_zone = trk["zone"]
+
+
+    if (
+        old_zone != "center"
+        and new_zone == "center"
+    ):
+
+        return True
+
+
+    return False
+
+
+# ============================================================
+# START DISPLAY
 # ============================================================
 
 print(
-    "\n"
-    + "=" * 70
+    "=" * 68
 )
 
 print(
-    "[SAHAYAK DRISHTI] "
-    "Assistive Vision Engine"
+    f" [SAHAYAK DRISHTI] "
+    f"Vision Engine Running: '{video_path}'"
 )
 
 print(
-    "[SYSTEM] YOLOv8n active"
+    f" [SYSTEM] Duration: "
+    f"{format_time(total_duration_sec)} "
+    f"| High-speed ARM Mode"
 )
 
 print(
-    "[SYSTEM] Frame skip:",
-    FRAME_SKIP
-)
-
-print(
-    "[SYSTEM] Goal: quiet, human-like walking assistance"
-)
-
-print(
-    "[SYSTEM] Camera/video:",
-    video_source
-)
-
-print(
-    "=" * 70
+    "=" * 68
     + "\n"
 )
 
 
 # ============================================================
-# MAIN LOOP
+# MAIN INFERENCE LOOP
 # ============================================================
 
 while cap.isOpened():
@@ -1708,10 +950,6 @@ while cap.isOpened():
     )
 
 
-    # --------------------------------------------------------
-    # Skip frames for performance.
-    # --------------------------------------------------------
-
     if (
         frame_count
         % FRAME_SKIP
@@ -1722,33 +960,70 @@ while cap.isOpened():
 
 
     # ========================================================
-    # YOLO DETECTION
+    # SAME PROGRESS DISPLAY
     # ========================================================
 
-    try:
+    percent = (
 
-        results = model(
-
-            frame,
-
-            imgsz=IMG_SIZE,
-
-            conf=CONFIDENCE,
-
-            verbose=False
+        int(
+            (frame_count / total_frames)
+            * 100
         )
 
-    except Exception as e:
+        if total_frames > 0
 
-        print(
-            f"\n[YOLO WARNING] {e}"
+        else 0
+    )
+
+
+    bar = (
+
+        "="
+        * (percent // 5)
+
+        + ">"
+
+        + " "
+        * (
+            20
+            - (percent // 5)
         )
+    )
 
-        continue
+
+    sys.stdout.write(
+
+        f"\rAnalyzing: "
+        f"[{bar}] "
+        f"{percent:3d}% "
+        f"("
+        f"{format_time(current_sec)}"
+        f" / "
+        f"{format_time(total_duration_sec)}"
+        f")"
+    )
+
+
+    sys.stdout.flush()
+
+
+    # ========================================================
+    # YOLO
+    # ========================================================
+
+    results = model(
+
+        frame,
+
+        imgsz=IMG_SIZE,
+
+        conf=CONFIDENCE,
+
+        verbose=False
+    )
 
 
     boxes = results[0].boxes
-
 
     detections = []
 
@@ -1760,7 +1035,6 @@ while cap.isOpened():
 
 
         for box in boxes:
-
 
             cls_id = int(
                 box.cls[0]
@@ -1787,15 +1061,6 @@ while cap.isOpened():
             )
 
 
-            box_w = (
-                x2 - x1
-            )
-
-            box_h = (
-                y2 - y1
-            )
-
-
             detections.append({
 
                 "label":
@@ -1808,15 +1073,15 @@ while cap.isOpened():
                     (y1 + y2) / 2.0,
 
                 "box_w":
-                    box_w,
+                    x2 - x1,
 
                 "box_h":
-                    box_h
+                    y2 - y1
             })
 
 
     # ========================================================
-    # UPDATE TRACKS
+    # TRACK
     # ========================================================
 
     match_detections(
@@ -1828,304 +1093,500 @@ while cap.isOpened():
 
 
     # ========================================================
-    # GET CONFIRMED OBJECTS
+    # CONFIRMED VISIBLE OBJECTS
     # ========================================================
 
-    visible = get_visible_tracks(
+    visible = [
 
-        current_sec
-    )
+        t
 
-
-    # ========================================================
-    # FIND WALKING-PATH OBSTACLES
-    # ========================================================
-
-    obstacles = find_path_obstacles(
-
-        visible
-    )
-
-
-    # ========================================================
-    # PATH CLEAR LOGIC
-    # ========================================================
-
-    path_clear = (
-        len(obstacles) == 0
-    )
-
-
-    # --------------------------------------------------------
-    # PATH IS CLEAR
-    # --------------------------------------------------------
-
-    if path_clear:
-
-
-        # Only announce when transitioning from
-        # obstacle -> clear.
-        #
-        # Do NOT announce repeatedly.
+        for t in tracks.values()
 
         if (
-            not path_was_clear
-            and not clear_announced
-        ):
 
-            msg = (
-                "The path ahead is clear."
-            )
+            current_sec
+            - t["last_seen"]
+            <= 0.4
 
+            and t["frames_seen"]
+            >= MIN_CONFIRMATIONS
 
-            timestamp = format_time(
-
-                current_sec
-            )
-
-
-            print(
-                f"\n[{timestamp}] "
-                f"[INFO] {msg}\n"
-            )
-
-
-            timeline_records.append({
-
-                "time":
-                    timestamp,
-
-                "message":
-                    msg
-            })
-
-
-            clear_announced = True
-
-
-            last_announcement_time = (
-                current_sec
-            )
-
-
-        path_was_clear = True
-
-
-        continue
-
-
-    # --------------------------------------------------------
-    # PATH IS NOT CLEAR
-    # --------------------------------------------------------
-
-    path_was_clear = False
-
-    clear_announced = False
-
-
-    # ========================================================
-    # BUILD ALERT
-    # ========================================================
-
-    alert_result = build_alert(
-
-        obstacles
-    )
-
-
-    if alert_result is None:
-
-        continue
-
-
-    base_message, lead = (
-        alert_result
-    )
-
-
-    # ========================================================
-    # CURRENT DISTANCE LEVEL
-    # ========================================================
-
-    current_level = (
-        get_distance_level(
-            lead
+            and (
+                t["box_h"]
+                / frame_h
+            ) >= 0.20
         )
-    )
+    ]
+
+
+    if not visible:
+
+        continue
 
 
     # ========================================================
-    # EMERGENCY STATE
+    # NEW LOGIC:
+    # DETERMINE REAL WALKING HAZARDS
     # ========================================================
 
-    emergency = (
+    valid_hazards = [
+
+        t
+
+        for t in visible
+
+        if sticks_into_lane(t)
+    ]
+
+
+    # ========================================================
+    # IF NOTHING ACTUALLY BLOCKS THE LANE
+    # ========================================================
+
+    if not valid_hazards:
+
+        continue
+
+
+    # ========================================================
+    # OBJECT ENTERING CENTER GETS PRIORITY
+    # ========================================================
+
+    entering_objects = [
+
+        t
+
+        for t in valid_hazards
+
+        if entering_center(t)
+    ]
+
+
+    if entering_objects:
+
+        entering_objects.sort(
+
+            key=lambda t:
+            t["box_h"],
+
+            reverse=True
+        )
+
+        lead = entering_objects[0]
+
+    else:
+
+        # Center objects have priority.
+        valid_hazards.sort(
+
+            key=lambda t: (
+
+                t["zone"] == "center",
+
+                t["box_h"]
+
+            ),
+
+            reverse=True
+        )
+
+
+        lead = valid_hazards[0]
+
+
+    # ========================================================
+    # EMERGENCY
+    # ========================================================
+
+    emergency_now = (
 
         lead["zone"]
         == "center"
 
-        and current_level
-        == "critical"
+        and lead["proximity"]
+        == "near"
     )
-
-
-    # IMPORTANT:
-    # Keep emergency timing based on time.time()
-    # consistently.
-
-    now = time.time()
 
 
     # ========================================================
     # EMERGENCY COOLDOWN
     # ========================================================
 
-    if emergency:
-
-        if (
-            now
-            - last_emergency_time
-            < EMERGENCY_COOLDOWN
-        ):
-
-            continue
+    now = time.time()
 
 
-    # ========================================================
-    # NORMAL COOLDOWN
-    # ========================================================
+    emergency_allowed = (
 
-    else:
-
-        if (
-            current_sec
-            - last_announcement_time
-            < NORMAL_REPEAT_COOLDOWN
-        ):
-
-            continue
-
-
-    # ========================================================
-    # DO NOT REPEAT THE SAME OBJECT
-    # UNLESS ITS STATE CHANGED
-    # ========================================================
-
-    if not emergency:
-
-        if not should_repeat(
-            lead
-        ):
-
-            continue
-
-
-    # ========================================================
-    # GEMINI CONTEXT
-    # ========================================================
-
-    scene_data = {
-
-        "main_object":
-            lead["label"],
-
-        "location":
-            lead["zone"],
-
-        "distance_level":
-            current_level,
-
-        "estimated_distance_m":
-            lead.get("dist_m"),
-
-        "movement":
-            get_movement(lead),
-
-        "crossing_direction":
-            get_crossing_direction(
-                lead
-            ),
-
-        "entering_walking_path":
-            is_entering_path(
-                lead
-            ),
-
-        "number_of_path_objects":
-            len(obstacles)
-    }
-
-
-    # ========================================================
-    # OPTIONAL GEMINI
-    # ========================================================
-
-    gemini_message = ask_gemini(
-
-        frame,
-
-        scene_data
+        now
+        - last_emergency_time
+        >= EMERGENCY_COOLDOWN
     )
 
 
-    # ========================================================
-    # FINAL MESSAGE
-    # ========================================================
-
-    if gemini_message:
-
-        msg = gemini_message
-
-    else:
-
-        msg = base_message
-
-
-    # ========================================================
-    # PREFIX
-    # ========================================================
-
-    if emergency:
-
-        prefix = "[URGENT]"
-
-    else:
-
-        prefix = "[INFO]"
-
-
-    # ========================================================
-    # OUTPUT
-    # ========================================================
-
-    timestamp = format_time(
+    cooldown_expired = (
 
         current_sec
-    )
-
-
-    print(
-        f"\n[{timestamp}] "
-        f"{prefix} "
-        f"{msg}\n"
+        - last_alert_time
+        >= ALERT_COOLDOWN
     )
 
 
     # ========================================================
-    # UPDATE STATE
+    # COUNT SAME OBJECT TYPE IN SAME POSITION
     # ========================================================
 
-    last_announcement_time = (
-        current_sec
+    zone_members = [
+
+        t
+
+        for t in valid_hazards
+
+        if (
+
+            t["label"]
+            == lead["label"]
+
+            and t["zone"]
+            == lead["zone"]
+        )
+    ]
+
+
+    count = len(
+        zone_members
     )
 
 
-    if emergency:
+    phrase = natural_phrase(
+
+        lead["label"],
+
+        count
+    )
+
+
+    movement = get_movement(
+
+        lead["history"]
+    )
+
+
+    # ========================================================
+    # DISTANCE
+    # ========================================================
+
+    dist_val = lead.get(
+        "dist_m"
+    )
+
+
+    dist_str = (
+
+        f"about {dist_val} meters"
+
+        if dist_val
+
+        else ""
+    )
+
+
+    # ========================================================
+    # SAME STATE SIGNATURE IDEA
+    # BUT NOW INCLUDES:
+    # POSITION + DISTANCE + MOVEMENT
+    # ========================================================
+
+    state_signature = (
+
+        f"{phrase}_"
+        f"{lead['zone']}_"
+        f"{dist_val}_"
+        f"{movement}"
+    )
+
+
+    should_announce = False
+
+
+    # ========================================================
+    # EMERGENCY ALWAYS GETS PRIORITY
+    # ========================================================
+
+    if (
+        emergency_now
+        and emergency_allowed
+    ):
+
+        should_announce = True
 
         last_emergency_time = now
 
 
-    remember_announcement(
-        lead
+    # ========================================================
+    # NORMAL ALERT
+    # ========================================================
+
+    elif (
+        cooldown_expired
+        and state_signature
+        != last_alert_summary
+    ):
+
+        should_announce = True
+
+
+    if not should_announce:
+
+        continue
+
+
+    # ========================================================
+    # POSITION
+    #
+    # KEEPING YOUR ORIGINAL CENTER / LEFT / RIGHT DISPLAY
+    # ========================================================
+
+    timestamp = format_time(
+        current_sec
+    )
+
+
+    location = (
+
+        "ahead of you"
+
+        if lead["zone"]
+        == "center"
+
+        else f"on your {lead['zone']}"
+    )
+
+
+    # ========================================================
+    # GEMINI CONTEXT
+    #
+    # We keep position + distance + movement.
+    # ========================================================
+
+    detected_context = {
+
+        "obstacle":
+            phrase,
+
+        "location":
+            location,
+
+        "distance":
+            dist_str,
+
+        "motion":
+            movement,
+
+        "emergency":
+            emergency_now
+    }
+
+
+    gemini_msg = ask_gemini(
+
+        frame,
+
+        detected_context
+    )
+
+
+    # ========================================================
+    # DISPLAY MESSAGE
+    #
+    # KEEPING YOUR ORIGINAL SENTENCE STYLE
+    # ========================================================
+
+    if gemini_msg:
+
+        msg = (
+
+            f"["
+            f"{'EMERGENCY' if emergency_now else 'ALERT'}"
+            f"] "
+            f"{gemini_msg}"
+        )
+
+
+    else:
+
+        dist_clause = (
+
+            f" {dist_str}"
+
+            if dist_str
+
+            else ""
+        )
+
+
+        be_verb = (
+
+            "is"
+
+            if count == 1
+
+            else "are"
+        )
+
+
+        # ----------------------------------------------------
+        # GROUP / TABLE BLOCK
+        # ----------------------------------------------------
+
+        center_items = [
+
+            t
+
+            for t in visible
+
+            if t["zone"]
+            == "center"
+        ]
+
+
+        has_table = any(
+
+            t["label"]
+            in [
+                "dining table",
+                "chair"
+            ]
+
+            for t
+            in center_items
+        )
+
+
+        people_in_center = sum(
+
+            1
+
+            for t
+            in center_items
+
+            if t["label"]
+            == "person"
+        )
+
+
+        is_hallway_blocked = (
+
+            (
+                has_table
+                and people_in_center >= 2
+            )
+
+            or
+
+            people_in_center >= 3
+        )
+
+
+        if is_hallway_blocked:
+
+            msg = (
+                "[ALERT] "
+                "Path blocked ahead by table and group. "
+                "Turn left or right to go around."
+            )
+
+
+        # ----------------------------------------------------
+        # SIDE CHAIR
+        # ----------------------------------------------------
+
+        elif (
+
+            lead["zone"]
+            != "center"
+
+            and lead["label"]
+            == "chair"
+
+        ):
+
+            steer_dir = (
+
+                "right"
+
+                if lead["zone"]
+                == "left"
+
+                else "left"
+            )
+
+
+            msg = (
+
+                f"[ALERT] Caution, chair "
+                f"sticking out on your "
+                f"{lead['zone']}, "
+                f"step {steer_dir}."
+            )
+
+
+        # ----------------------------------------------------
+        # EMERGENCY
+        # ----------------------------------------------------
+
+        elif emergency_now:
+
+            msg = (
+
+                f"[EMERGENCY] Careful, "
+                f"{phrase} "
+                f"{be_verb} very close "
+                f"{location}"
+                f"{dist_clause}!"
+            )
+
+
+        # ----------------------------------------------------
+        # NORMAL ALERT
+        # ----------------------------------------------------
+
+        else:
+
+            msg = (
+
+                f"[ALERT] Caution, "
+                f"{phrase} "
+                f"{be_verb} "
+                f"{location}"
+                f"{dist_clause}."
+            )
+
+
+    # ========================================================
+    # SAME DISPLAY FORMAT
+    # ========================================================
+
+    sys.stdout.write(
+
+        f"\r{' ' * 85}\r\n"
+        f"[{timestamp}] {msg}\n\n"
+    )
+
+
+    sys.stdout.flush()
+
+
+    # ========================================================
+    # UPDATE ALERT STATE
+    # ========================================================
+
+    last_alert_time = (
+        current_sec
+    )
+
+
+    last_alert_summary = (
+        state_signature
     )
 
 
@@ -2147,36 +1608,38 @@ cap.release()
 
 
 print(
-    "\n"
-    + "=" * 70
+    "\n\n"
+    + "=" * 68
 )
 
 print(
-    "ASSISTIVE SCENE SUMMARY"
+    " ASSISTIVE SCENE SUMMARY"
 )
 
 print(
-    "=" * 70
+    "=" * 68
+    + "\n"
 )
 
 
 if timeline_records:
 
-    for record in timeline_records:
+    for rec in timeline_records:
 
         print(
-
-            f"[{record['time']}] "
-            f"{record['message']}"
+            f" [{rec['time']}] "
+            f"{rec['message']}\n"
         )
 
 else:
 
     print(
-        "No significant obstacles detected."
+        " Path remained clear "
+        "throughout navigation.\n"
     )
 
 
 print(
-    "=" * 70
+    "=" * 68
+    + "\n"
 )
