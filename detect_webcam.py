@@ -9,1637 +9,326 @@ from ultralytics import YOLO
 # ============================================================
 # CONFIGURATION
 # ============================================================
-
 MODEL_PATH = "yolov8n.pt"
-
-video_path = sys.argv[1] if len(sys.argv) > 1 else "street_walk.mp4"
+video_path = sys.argv[1] if len(sys.argv) > 1 else "lib1.mp4"
 
 IMG_SIZE = 384
-CONFIDENCE = 0.48
-
+CONFIDENCE = 0.45
 FRAME_SKIP = 3
 
-ALERT_COOLDOWN = 3.5
+ALERT_COOLDOWN = 3.0
 EMERGENCY_COOLDOWN = 1.2
 GEMINI_COOLDOWN = 4.0
 
 MAX_TRACK_DISTANCE = 110
-MAX_TRACK_AGE = 1.0
+MAX_TRACK_AGE = 0.8
+MIN_CONFIRMATIONS = 2
 
-MIN_CONFIRMATIONS = 3
-MOVEMENT_HISTORY = 6
-
-LEFT_BOUNDARY = 0.35
-RIGHT_BOUNDARY = 0.65
-
-HYSTERESIS_RATIO = 0.05
-
-NEAR_RATIO = 0.35
+# Walking Corridor (Center 36% of the view)
+LEFT_BOUNDARY = 0.32
+RIGHT_BOUNDARY = 0.68
+HYSTERESIS_RATIO = 0.04
 
 ALLOWED_OBSTACLES = {
-    "person",
-    "bicycle",
-    "car",
-    "motorcycle",
-    "bus",
-    "truck",
-    "dog",
-    "chair",
-    "dining table"
+    "person", "bicycle", "car", "motorcycle", "bus", "truck", "dog", "chair", "dining table"
 }
 
-AVERAGE_WIDTHS = {
-    "person": 0.45,
-    "bicycle": 0.60,
-    "motorcycle": 0.80,
-    "car": 1.80,
-    "bus": 2.50,
-    "truck": 2.50,
-    "dog": 0.40,
-    "chair": 0.50,
-    "dining table": 0.90
+# Real-world object reference heights in meters (Height is more stable than width)
+AVERAGE_HEIGHTS = {
+    "person": 1.70, "bicycle": 1.00, "motorcycle": 1.10,
+    "car": 1.50, "bus": 3.00, "truck": 3.00, "dog": 0.50,
+    "chair": 0.85, "dining table": 0.75
 }
-
-APPROX_FOCAL_LENGTH_PIXELS = 700.0
-
+FOCAL_LENGTH_PIXELS = 650.0
 
 # ============================================================
-# GENAI SETUP (GEMINI)
+# GEMINI SETUP
 # ============================================================
-
 gemini_client = None
-
 api_key = os.getenv("GEMINI_API_KEY")
 
 if api_key:
-
     try:
-
         from google import genai
-
-        gemini_client = genai.Client(
-            api_key=api_key
-        )
-
-        print(
-            "\n[SYSTEM] Gemini GenAI Engine: ENABLED\n"
-        )
-
+        gemini_client = genai.Client(api_key=api_key)
+        print("\n[SYSTEM] Gemini GenAI Engine: ENABLED\n")
     except Exception as e:
-
-        print(
-            f"\n[SYSTEM] Gemini setup warning: {e}\n"
-        )
-
+        print(f"\n[SYSTEM] Gemini setup warning: {e}\n")
 else:
-
-    print(
-        "\n[SYSTEM] Gemini GenAI: DISABLED "
-        "(GEMINI_API_KEY not set)\n"
-    )
-
+    print("\n[SYSTEM] Gemini GenAI: DISABLED (GEMINI_API_KEY not set)\n")
 
 # ============================================================
 # INITIALIZATION
 # ============================================================
-
 model = YOLO(MODEL_PATH)
-
 cap = cv2.VideoCapture(video_path)
 
 if not cap.isOpened():
-
-    print(
-        f"Error: Cannot open '{video_path}'."
-    )
-
+    print(f"Error: Cannot open '{video_path}'.")
     sys.exit(1)
 
+fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+total_frames = int(cap.get(cv2.CAP_PROP_FRAME_COUNT))
+total_duration_sec = total_frames / fps
+frame_h = int(cap.get(cv2.CAP_PROP_FRAME_HEIGHT)) or 480
+frame_w = int(cap.get(cv2.CAP_PROP_FRAME_WIDTH)) or 640
 
-fps = cap.get(
-    cv2.CAP_PROP_FPS
-) or 30.0
-
-total_frames = int(
-    cap.get(cv2.CAP_PROP_FRAME_COUNT)
-)
-
-total_duration_sec = (
-    total_frames / fps
-)
-
-frame_h = int(
-    cap.get(cv2.CAP_PROP_FRAME_HEIGHT)
-)
-
-frame_w = int(
-    cap.get(cv2.CAP_PROP_FRAME_WIDTH)
-)
-
-b1 = (
-    frame_w * LEFT_BOUNDARY
-)
-
-b2 = (
-    frame_w * RIGHT_BOUNDARY
-)
-
-hysteresis_margin = (
-    frame_w * HYSTERESIS_RATIO
-)
-
+b1 = frame_w * LEFT_BOUNDARY
+b2 = frame_w * RIGHT_BOUNDARY
+hysteresis_margin = frame_w * HYSTERESIS_RATIO
 
 tracks = {}
-
 next_track_id = 1
-
 last_alert_time = -10.0
-
-last_gemini_time = -10.0
-
-last_alert_summary = ""
-
 last_emergency_time = -10.0
-
+last_gemini_time = -10.0
+last_alert_signature = ""
 timeline_records = []
-
 frame_count = 0
 
-
-# ============================================================
-# FUNCTIONS
-# ============================================================
-
 def format_time(seconds):
+    return f"{int(seconds // 60):02d}:{int(seconds % 60):02d}"
 
-    return (
-        f"{int(seconds // 60):02d}:"
-        f"{int(seconds % 60):02d}"
-    )
+def distance(x1, y1, x2, y2):
+    return math.hypot(x2 - x1, y2 - y1)
 
-
-def distance(
-    x1,
-    y1,
-    x2,
-    y2
-):
-
-    return math.hypot(
-        x2 - x1,
-        y2 - y1
-    )
-
-
-def estimate_distance_meters(
-    label,
-    box_w
-):
-
-    if (
-        label not in AVERAGE_WIDTHS
-        or box_w <= 5
-    ):
-
+def estimate_distance_meters(label, box_h):
+    if label not in AVERAGE_HEIGHTS or box_h <= 5:
         return None
-
-
-    raw_dist = (
-
-        AVERAGE_WIDTHS[label]
-        * APPROX_FOCAL_LENGTH_PIXELS
-
-    ) / box_w
-
-
-    raw_dist = max(
-        0.5,
-        min(25.0, raw_dist)
-    )
-
-
-    if raw_dist < 1.5:
-
+    raw_dist = (AVERAGE_HEIGHTS[label] * FOCAL_LENGTH_PIXELS) / box_h
+    raw_dist = max(0.5, min(20.0, raw_dist))
+    if raw_dist < 1.8:
         return 1
-
-    elif raw_dist < 3.5:
-
+    elif raw_dist < 3.8:
         return 3
-
-    elif raw_dist < 6.0:
-
+    elif raw_dist < 6.5:
         return 5
+    return round(raw_dist / 5.0) * 5
 
-    elif raw_dist < 9.0:
-
-        return 8
-
-    return round(
-        raw_dist / 5.0
-    ) * 5
-
-
-# ============================================================
-# POSITION: LEFT / CENTER / RIGHT
-# ============================================================
-
-def get_zone(
-    x,
-    previous_zone
-):
-
+def get_zone(x, previous_zone=None):
     if previous_zone == "left":
-
-        if x < (
-            b1 + hysteresis_margin
-        ):
-
-            return "left"
-
-        return (
-            "right"
-            if x > b2
-            else "center"
-        )
-
-
+        return "left" if x < (b1 + hysteresis_margin) else ("right" if x > b2 else "center")
     elif previous_zone == "center":
-
-        if x < (
-            b1 - hysteresis_margin
-        ):
-
-            return "left"
-
-        if x > (
-            b2 + hysteresis_margin
-        ):
-
-            return "right"
-
+        if x < (b1 - hysteresis_margin): return "left"
+        if x > (b2 + hysteresis_margin): return "right"
         return "center"
-
-
     elif previous_zone == "right":
+        return "right" if x > (b2 - hysteresis_margin) else ("left" if x < b1 else "center")
+    return "left" if x < b1 else ("right" if x > b2 else "center")
 
-        if x > (
-            b2 - hysteresis_margin
-        ):
-
-            return "right"
-
-        return (
-            "left"
-            if x < b1
-            else "center"
-        )
-
-
-    else:
-
-        if x < b1:
-
-            return "left"
-
-        if x > b2:
-
-            return "right"
-
-        return "center"
-
-
-# ============================================================
-# MOVEMENT
-# ============================================================
-
-def get_movement(history):
-
-    if len(history) < 3:
-
-        return "moving ahead"
-
-
-    dx = (
-        history[-1][0]
-        - history[0][0]
-    )
-
-    dh = (
-        history[-1][1]
-        - history[0][1]
-    )
-
-
-    h_thresh = (
-        frame_w * 0.035
-    )
-
-
-    h_move = (
-
-        "to the right"
-
-        if dx > h_thresh
-
-        else (
-
-            "to the left"
-
-            if dx < -h_thresh
-
-            else None
-        )
-    )
-
-
-    approaching = (
-        dh > 0.08
-    )
-
-
-    if approaching and h_move:
-
-        return (
-            f"approaching from {h_move}"
-        )
-
-
-    if approaching:
-
-        return "approaching"
-
-
-    if h_move:
-
-        return (
-            f"shifting {h_move}"
-        )
-
-
-    return "moving ahead"
-
-
-# ============================================================
-# NATURAL OBJECT PHRASE
-# ============================================================
-
-def natural_phrase(
-    label,
-    count
-):
-
-    if label == "person":
-
-        return (
-
-            "one person"
-
-            if count == 1
-
-            else (
-
-                "two people"
-
-                if count == 2
-
-                else f"{count} people"
-            )
-        )
-
-
-    return (
-
-        f"one {label}"
-
-        if count == 1
-
-        else f"{count} {label}s"
-    )
-
-
-# ============================================================
-# GEMINI
-# ============================================================
-
-def ask_gemini(
-    frame,
-    detected_info
-):
-
+def ask_gemini(frame, prompt_context):
     global last_gemini_time
-
-
     if not gemini_client:
-
         return None
-
-
     now = time.time()
-
-
-    if (
-        now - last_gemini_time
-        < GEMINI_COOLDOWN
-    ):
-
+    if now - last_gemini_time < GEMINI_COOLDOWN:
         return None
-
 
     try:
-
         from google.genai import types
+        small_frame = cv2.resize(frame, (320, 240))
+        _, encoded = cv2.imencode(".jpg", small_frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
 
-
-        small_frame = cv2.resize(
-            frame,
-            (320, 240)
-        )
-
-
-        _, encoded = cv2.imencode(
-
-            ".jpg",
-
-            small_frame,
-
-            [
-                cv2.IMWRITE_JPEG_QUALITY,
-                60
-            ]
-        )
-
-
-        prompt = f"""
-You are the voice of a smart cane for a visually impaired user.
-
-Summarize the key obstacle in 1 concise, calm sentence based only on
-these confirmed detections:
-
-{detected_info}
-
-Include distance in meters if available.
-Include the object's position if available.
-Do not invent details.
-Do not remove the confirmed position or distance.
-Return only the spoken sentence.
-"""
-
+        prompt = f"""You are an assistive voice for a blind person walking indoors.
+Obstacle data: {prompt_context}
+State what is directly blocking them or if they must turn. Keep it to 1 calm sentence under 12 words."""
 
         response = gemini_client.models.generate_content(
-
             model="gemini-2.5-flash",
-
-            contents=[
-
-                types.Part.from_bytes(
-
-                    data=encoded.tobytes(),
-
-                    mime_type="image/jpeg"
-                ),
-
-                prompt
-            ],
-
-            config=types.GenerateContentConfig(
-
-                temperature=0.1,
-
-                max_output_tokens=40
-            )
+            contents=[types.Part.from_bytes(data=encoded.tobytes(), mime_type="image/jpeg"), prompt],
+            config=types.GenerateContentConfig(temperature=0.1, max_output_tokens=30)
         )
-
-
         last_gemini_time = now
-
-
         if response.text:
-
-            return (
-                response.text
-                .strip()
-                .replace("\n", " ")
-            )
-
-
+            return response.text.strip().replace("\n", " ")
     except Exception:
-
         pass
-
-
     return None
 
-
-# ============================================================
-# TRACKING
-# ============================================================
-
-def match_detections(
-    detections,
-    current_sec
-):
-
+def match_detections(detections, current_sec):
     global next_track_id
-
     matched = set()
 
-
     for det in detections:
-
-        best_id = None
-
-        min_d = float("inf")
-
-
+        best_id, min_d = None, float("inf")
         for t_id, trk in tracks.items():
-
-            if (
-                t_id in matched
-                or trk["label"]
-                != det["label"]
-            ):
-
+            if t_id in matched or trk["label"] != det["label"]:
                 continue
-
-
-            if (
-                current_sec
-                - trk["last_seen"]
-                > MAX_TRACK_AGE
-            ):
-
+            if current_sec - trk["last_seen"] > MAX_TRACK_AGE:
                 continue
-
-
-            d = distance(
-
-                det["x"],
-                det["y"],
-
-                trk["x"],
-                trk["y"]
-            )
-
-
+            d = distance(det["x"], det["y"], trk["x"], trk["y"])
             if d < min_d:
+                min_d, best_id = d, t_id
 
-                min_d = d
+        dist_m = estimate_distance_meters(det["label"], det["box_h"])
+        x1 = det["x"] - det["box_w"] / 2
+        x2 = det["x"] + det["box_w"] / 2
 
-                best_id = t_id
-
-
-        dist_m = estimate_distance_meters(
-
-            det["label"],
-
-            det["box_w"]
-        )
-
-
-        # ====================================================
-        # UPDATE EXISTING TRACK
-        # ====================================================
-
-        if (
-
-            best_id is not None
-
-            and min_d
-            <= MAX_TRACK_DISTANCE
-
-        ):
-
+        if best_id is not None and min_d <= MAX_TRACK_DISTANCE:
             trk = tracks[best_id]
-
-
-            trk["x"] = det["x"]
-
-            trk["y"] = det["y"]
-
-
-            trk["x1"] = (
-                det["x"]
-                - det["box_w"] / 2
-            )
-
-            trk["x2"] = (
-                det["x"]
-                + det["box_w"] / 2
-            )
-
-
-            trk["box_h"] = (
-                det["box_h"]
-            )
-
-            trk["box_w"] = (
-                det["box_w"]
-            )
-
-
-            trk["dist_m"] = (
-                dist_m
-            )
-
-
-            trk["last_seen"] = (
-                current_sec
-            )
-
-
+            trk["x"], trk["y"] = det["x"], det["y"]
+            trk["x1"], trk["x2"] = x1, x2
+            trk["box_h"], trk["box_w"] = det["box_h"], det["box_w"]
+            trk["dist_m"] = dist_m
+            trk["last_seen"] = current_sec
             trk["frames_seen"] += 1
-
-
-            trk["history"].append(
-
-                (
-                    det["x"],
-
-                    det["box_h"]
-                    / frame_h
-                )
-            )
-
-
-            trk["zone"] = get_zone(
-
-                det["x"],
-
-                trk["zone"]
-            )
-
-
-            trk["proximity"] = (
-
-                "near"
-
-                if (
-                    det["box_h"]
-                    / frame_h
-                ) > NEAR_RATIO
-
-                else "far"
-            )
-
-
-            matched.add(
-                best_id
-            )
-
-
-        # ====================================================
-        # NEW TRACK
-        # ====================================================
-
+            trk["zone"] = get_zone(det["x"], trk["zone"])
+            matched.add(best_id)
         else:
-
             t_id = next_track_id
-
             next_track_id += 1
-
-
-            init_zone = get_zone(
-
-                det["x"],
-
-                None
-            )
-
-
             tracks[t_id] = {
-
                 "id": t_id,
-
-                "label":
-                    det["label"],
-
-                "x":
-                    det["x"],
-
-                "y":
-                    det["y"],
-
-                "x1":
-                    det["x"]
-                    - det["box_w"] / 2,
-
-                "x2":
-                    det["x"]
-                    + det["box_w"] / 2,
-
-                "box_h":
-                    det["box_h"],
-
-                "box_w":
-                    det["box_w"],
-
-                "dist_m":
-                    dist_m,
-
-                "first_seen":
-                    current_sec,
-
-                "last_seen":
-                    current_sec,
-
-                "frames_seen":
-                    1,
-
-                "history":
-                    deque(
-
-                        [
-                            (
-                                det["x"],
-
-                                det["box_h"]
-                                / frame_h
-                            )
-                        ],
-
-                        maxlen=
-                        MOVEMENT_HISTORY
-                    ),
-
-                "zone":
-                    init_zone,
-
-                "proximity":
-
-                    "near"
-
-                    if (
-                        det["box_h"]
-                        / frame_h
-                    ) > NEAR_RATIO
-
-                    else "far"
+                "label": det["label"],
+                "x": det["x"],
+                "y": det["y"],
+                "x1": x1,
+                "x2": x2,
+                "box_h": det["box_h"],
+                "box_w": det["box_w"],
+                "dist_m": dist_m,
+                "last_seen": current_sec,
+                "frames_seen": 1,
+                "zone": get_zone(det["x"])
             }
+            matched.add(t_id)
 
-
-            matched.add(
-                t_id
-            )
-
-
-    # ========================================================
-    # REMOVE OLD TRACKS
-    # ========================================================
-
-    for t_id in [
-
-        k
-
-        for k, v
-        in tracks.items()
-
-        if (
-            current_sec
-            - v["last_seen"]
-            > MAX_TRACK_AGE
-        )
-    ]:
-
+    for t_id in [k for k, v in tracks.items() if current_sec - v["last_seen"] > MAX_TRACK_AGE]:
         del tracks[t_id]
 
-
-# ============================================================
-# NEW LOGIC:
-# DOES OBJECT ACTUALLY ENTER THE WALKING LANE?
-#
-# This is the main change.
-# ============================================================
-
-def sticks_into_lane(trk):
-
-    # Objects in the center are already in the path.
-    if trk["zone"] == "center":
-
-        return True
-
-
-    # For side objects, check the actual bounding box.
-    # This prevents a chair/table beside the path from being
-    # announced unless it actually extends into the lane.
-
-    x1 = trk.get(
-        "x1",
-        0
-    )
-
-    x2 = trk.get(
-        "x2",
-        0
-    )
-
-
-    # The object overlaps the central walking corridor.
-    overlaps_lane = (
-
-        x2 > b1
-
-        and x1 < b2
-    )
-
-
-    if not overlaps_lane:
-
-        return False
-
-
-    # For chairs/tables, only announce if reasonably close.
-    if trk["label"] in [
-        "chair",
-        "dining table"
-    ]:
-
-        return (
-            trk["proximity"]
-            == "near"
-        )
-
-
-    # People/vehicles/bicycles/dogs etc.
-    # entering the lane should be considered relevant.
-    return True
-
-
-# ============================================================
-# NEW LOGIC:
-# DETECT OBJECT MOVING FROM SIDE INTO CENTER
-# ============================================================
-
-def entering_center(trk):
-
-    history = trk["history"]
-
-
-    if len(history) < 4:
-
-        return False
-
-
-    old_x = history[0][0]
-
-    new_x = history[-1][0]
-
-
-    old_zone = get_zone(
-        old_x,
-        None
-    )
-
-    new_zone = trk["zone"]
-
-
-    if (
-        old_zone != "center"
-        and new_zone == "center"
-    ):
-
-        return True
-
-
-    return False
-
-
-# ============================================================
-# START DISPLAY
-# ============================================================
-
-print(
-    "=" * 68
-)
-
-print(
-    f" [SAHAYAK DRISHTI] "
-    f"Vision Engine Running: '{video_path}'"
-)
-
-print(
-    f" [SYSTEM] Duration: "
-    f"{format_time(total_duration_sec)} "
-    f"| High-speed ARM Mode"
-)
-
-print(
-    "=" * 68
-    + "\n"
-)
-
+print("=" * 68)
+print(f" [SAHAYAK DRISHTI] High-Priority Safety Engine: '{video_path}'")
+print("=" * 68 + "\n")
 
 # ============================================================
 # MAIN INFERENCE LOOP
 # ============================================================
-
 while cap.isOpened():
-
     ret, frame = cap.read()
-
-
     if not ret:
-
         break
 
-
     frame_count += 1
+    current_sec = frame_count / fps
 
-
-    current_sec = (
-        frame_count / fps
-    )
-
-
-    if (
-        frame_count
-        % FRAME_SKIP
-        != 0
-    ):
-
+    if frame_count % FRAME_SKIP != 0:
         continue
 
-
-    # ========================================================
-    # SAME PROGRESS DISPLAY
-    # ========================================================
-
-    percent = (
-
-        int(
-            (frame_count / total_frames)
-            * 100
-        )
-
-        if total_frames > 0
-
-        else 0
-    )
-
-
-    bar = (
-
-        "="
-        * (percent // 5)
-
-        + ">"
-
-        + " "
-        * (
-            20
-            - (percent // 5)
-        )
-    )
-
-
-    sys.stdout.write(
-
-        f"\rAnalyzing: "
-        f"[{bar}] "
-        f"{percent:3d}% "
-        f"("
-        f"{format_time(current_sec)}"
-        f" / "
-        f"{format_time(total_duration_sec)}"
-        f")"
-    )
-
-
+    percent = int((frame_count / total_frames) * 100) if total_frames > 0 else 0
+    bar = "=" * (percent // 5) + ">" + " " * (20 - (percent // 5))
+    sys.stdout.write(f"\rAnalyzing: [{bar}] {percent:3d}% ({format_time(current_sec)} / {format_time(total_duration_sec)})")
     sys.stdout.flush()
 
-
-    # ========================================================
-    # YOLO
-    # ========================================================
-
-    results = model(
-
-        frame,
-
-        imgsz=IMG_SIZE,
-
-        conf=CONFIDENCE,
-
-        verbose=False
-    )
-
-
+    results = model(frame, imgsz=IMG_SIZE, conf=CONFIDENCE, verbose=False)
     boxes = results[0].boxes
 
     detections = []
-
-
-    if (
-        boxes is not None
-        and len(boxes) > 0
-    ):
-
-
+    if boxes is not None and len(boxes) > 0:
         for box in boxes:
-
-            cls_id = int(
-                box.cls[0]
-            )
-
-
-            label = model.names[
-                cls_id
-            ]
-
-
-            if (
-                label
-                not in ALLOWED_OBSTACLES
-            ):
-
+            cls_id = int(box.cls[0])
+            label = model.names[cls_id]
+            if label not in ALLOWED_OBSTACLES:
                 continue
 
-
-            x1, y1, x2, y2 = (
-
-                box.xyxy[0]
-                .tolist()
-            )
-
-
+            x1, y1, x2, y2 = box.xyxy[0].tolist()
             detections.append({
-
-                "label":
-                    label,
-
-                "x":
-                    (x1 + x2) / 2.0,
-
-                "y":
-                    (y1 + y2) / 2.0,
-
-                "box_w":
-                    x2 - x1,
-
-                "box_h":
-                    y2 - y1
+                "label": label,
+                "x": (x1 + x2) / 2.0,
+                "y": (y1 + y2) / 2.0,
+                "box_w": x2 - x1,
+                "box_h": y2 - y1
             })
 
+    match_detections(detections, current_sec)
 
-    # ========================================================
-    # TRACK
-    # ========================================================
-
-    match_detections(
-
-        detections,
-
-        current_sec
-    )
-
-
-    # ========================================================
-    # CONFIRMED VISIBLE OBJECTS
-    # ========================================================
-
+    # 1. Filter out far background objects (height >= 18% of frame)
     visible = [
-
-        t
-
-        for t in tracks.values()
-
-        if (
-
-            current_sec
-            - t["last_seen"]
-            <= 0.4
-
-            and t["frames_seen"]
-            >= MIN_CONFIRMATIONS
-
-            and (
-                t["box_h"]
-                / frame_h
-            ) >= 0.20
-        )
+        t for t in tracks.values()
+        if (current_sec - t["last_seen"] <= 0.4 and t["frames_seen"] >= MIN_CONFIRMATIONS and (t["box_h"] / frame_h) >= 0.18)
     ]
-
-
     if not visible:
-
         continue
 
+    # 2. Check if the hallway/corridor is blocked by seating or a group ahead
+    center_items = [t for t in visible if t["zone"] == "center"]
+    has_table = any(t["label"] in ["dining table", "chair"] for t in center_items)
+    people_in_center = sum(1 for t in center_items if t["label"] == "person")
+    is_corridor_blocked = (has_table and people_in_center >= 2) or (people_in_center >= 3)
 
-    # ========================================================
-    # NEW LOGIC:
-    # DETERMINE REAL WALKING HAZARDS
-    # ========================================================
+    # 3. Check for hazards: objects in center OR side furniture sticking into the path
+    def is_walking_hazard(t):
+        if t["zone"] == "center":
+            return True
+        # Side chair/table sticking its edges across the corridor line
+        if t["label"] in ["chair", "dining table"]:
+            if (t["x2"] > b1 and t["x1"] < b2) and (t["box_h"] / frame_h >= 0.22):
+                return True
+        return False
 
-    valid_hazards = [
-
-        t
-
-        for t in visible
-
-        if sticks_into_lane(t)
-    ]
-
-
-    # ========================================================
-    # IF NOTHING ACTUALLY BLOCKS THE LANE
-    # ========================================================
-
-    if not valid_hazards:
-
+    hazards = [t for t in visible if is_walking_hazard(t)]
+    if not hazards and not is_corridor_blocked:
         continue
 
+    # 4. Pick leading obstacle
+    hazards.sort(key=lambda t: (t["zone"] == "center", t["box_h"]), reverse=True)
+    lead = hazards[0] if hazards else center_items[0]
 
-    # ========================================================
-    # OBJECT ENTERING CENTER GETS PRIORITY
-    # ========================================================
+    dist_val = lead.get("dist_m")
+    dist_str = f"about {dist_val} meters" if dist_val else "close to you"
+    is_emergency = (lead["zone"] == "center" and ((lead["box_h"] / frame_h) >= 0.38 or (dist_val is not None and dist_val <= 1)))
 
-    entering_objects = [
+    emergency_allowed = (current_sec - last_emergency_time >= EMERGENCY_COOLDOWN)
+    cooldown_expired = (current_sec - last_alert_time >= ALERT_COOLDOWN)
 
-        t
-
-        for t in valid_hazards
-
-        if entering_center(t)
-    ]
-
-
-    if entering_objects:
-
-        entering_objects.sort(
-
-            key=lambda t:
-            t["box_h"],
-
-            reverse=True
-        )
-
-        lead = entering_objects[0]
-
-    else:
-
-        # Center objects have priority.
-        valid_hazards.sort(
-
-            key=lambda t: (
-
-                t["zone"] == "center",
-
-                t["box_h"]
-
-            ),
-
-            reverse=True
-        )
-
-
-        lead = valid_hazards[0]
-
-
-    # ========================================================
-    # EMERGENCY
-    # ========================================================
-
-    emergency_now = (
-
-        lead["zone"]
-        == "center"
-
-        and lead["proximity"]
-        == "near"
-    )
-
-
-    # ========================================================
-    # EMERGENCY COOLDOWN
-    # ========================================================
-
-    now = time.time()
-
-
-    emergency_allowed = (
-
-        now
-        - last_emergency_time
-        >= EMERGENCY_COOLDOWN
-    )
-
-
-    cooldown_expired = (
-
-        current_sec
-        - last_alert_time
-        >= ALERT_COOLDOWN
-    )
-
-
-    # ========================================================
-    # COUNT SAME OBJECT TYPE IN SAME POSITION
-    # ========================================================
-
-    zone_members = [
-
-        t
-
-        for t in valid_hazards
-
-        if (
-
-            t["label"]
-            == lead["label"]
-
-            and t["zone"]
-            == lead["zone"]
-        )
-    ]
-
-
-    count = len(
-        zone_members
-    )
-
-
-    phrase = natural_phrase(
-
-        lead["label"],
-
-        count
-    )
-
-
-    movement = get_movement(
-
-        lead["history"]
-    )
-
-
-    # ========================================================
-    # DISTANCE
-    # ========================================================
-
-    dist_val = lead.get(
-        "dist_m"
-    )
-
-
-    dist_str = (
-
-        f"about {dist_val} meters"
-
-        if dist_val
-
-        else ""
-    )
-
-
-    # ========================================================
-    # SAME STATE SIGNATURE IDEA
-    # BUT NOW INCLUDES:
-    # POSITION + DISTANCE + MOVEMENT
-    # ========================================================
-
-    state_signature = (
-
-        f"{phrase}_"
-        f"{lead['zone']}_"
-        f"{dist_val}_"
-        f"{movement}"
-    )
-
+    state_sig = f"{lead['label']}_{lead['zone']}_{dist_val}_{is_corridor_blocked}"
 
     should_announce = False
-
-
-    # ========================================================
-    # EMERGENCY ALWAYS GETS PRIORITY
-    # ========================================================
-
-    if (
-        emergency_now
-        and emergency_allowed
-    ):
-
+    if is_emergency and emergency_allowed:
+        should_announce = True
+        last_emergency_time = current_sec
+    elif cooldown_expired and state_sig != last_alert_signature:
         should_announce = True
 
-        last_emergency_time = now
-
-
-    # ========================================================
-    # NORMAL ALERT
-    # ========================================================
-
-    elif (
-        cooldown_expired
-        and state_signature
-        != last_alert_summary
-    ):
-
-        should_announce = True
-
-
-    if not should_announce:
-
-        continue
-
-
-    # ========================================================
-    # POSITION
-    #
-    # KEEPING YOUR ORIGINAL CENTER / LEFT / RIGHT DISPLAY
-    # ========================================================
-
-    timestamp = format_time(
-        current_sec
-    )
-
-
-    location = (
-
-        "ahead of you"
-
-        if lead["zone"]
-        == "center"
-
-        else f"on your {lead['zone']}"
-    )
-
-
-    # ========================================================
-    # GEMINI CONTEXT
-    #
-    # We keep position + distance + movement.
-    # ========================================================
-
-    detected_context = {
-
-        "obstacle":
-            phrase,
-
-        "location":
-            location,
-
-        "distance":
-            dist_str,
-
-        "motion":
-            movement,
-
-        "emergency":
-            emergency_now
-    }
-
-
-    gemini_msg = ask_gemini(
-
-        frame,
-
-        detected_context
-    )
-
-
-    # ========================================================
-    # DISPLAY MESSAGE
-    #
-    # KEEPING YOUR ORIGINAL SENTENCE STYLE
-    # ========================================================
-
-    if gemini_msg:
-
-        msg = (
-
-            f"["
-            f"{'EMERGENCY' if emergency_now else 'ALERT'}"
-            f"] "
-            f"{gemini_msg}"
-        )
-
-
-    else:
-
-        dist_clause = (
-
-            f" {dist_str}"
-
-            if dist_str
-
-            else ""
-        )
-
-
-        be_verb = (
-
-            "is"
-
-            if count == 1
-
-            else "are"
-        )
-
-
-        # ----------------------------------------------------
-        # GROUP / TABLE BLOCK
-        # ----------------------------------------------------
-
-        center_items = [
-
-            t
-
-            for t in visible
-
-            if t["zone"]
-            == "center"
-        ]
-
-
-        has_table = any(
-
-            t["label"]
-            in [
-                "dining table",
-                "chair"
-            ]
-
-            for t
-            in center_items
-        )
-
-
-        people_in_center = sum(
-
-            1
-
-            for t
-            in center_items
-
-            if t["label"]
-            == "person"
-        )
-
-
-        is_hallway_blocked = (
-
-            (
-                has_table
-                and people_in_center >= 2
-            )
-
-            or
-
-            people_in_center >= 3
-        )
-
-
-        if is_hallway_blocked:
-
-            msg = (
-                "[ALERT] "
-                "Path blocked ahead by table and group. "
-                "Turn left or right to go around."
-            )
-
-
-        # ----------------------------------------------------
-        # SIDE CHAIR
-        # ----------------------------------------------------
-
-        elif (
-
-            lead["zone"]
-            != "center"
-
-            and lead["label"]
-            == "chair"
-
-        ):
-
-            steer_dir = (
-
-                "right"
-
-                if lead["zone"]
-                == "left"
-
-                else "left"
-            )
-
-
-            msg = (
-
-                f"[ALERT] Caution, chair "
-                f"sticking out on your "
-                f"{lead['zone']}, "
-                f"step {steer_dir}."
-            )
-
-
-        # ----------------------------------------------------
-        # EMERGENCY
-        # ----------------------------------------------------
-
-        elif emergency_now:
-
-            msg = (
-
-                f"[EMERGENCY] Careful, "
-                f"{phrase} "
-                f"{be_verb} very close "
-                f"{location}"
-                f"{dist_clause}!"
-            )
-
-
-        # ----------------------------------------------------
-        # NORMAL ALERT
-        # ----------------------------------------------------
-
+    if should_announce:
+        timestamp = format_time(current_sec)
+        location = "ahead of you" if lead["zone"] == "center" else f"on your {lead['zone']}"
+
+        # PRIORITY 1: Hallway blocked ahead
+        if is_corridor_blocked:
+            msg = "[ALERT] Path blocked ahead by table and seated group. Turn left or right to go around."
+
+        # PRIORITY 2: Protruding side chair
+        elif lead["zone"] != "center" and lead["label"] == "chair":
+            steer = "right" if lead["zone"] == "left" else "left"
+            msg = f"[ALERT] Caution, chair sticking out on your {lead['zone']}, step {steer}."
+
+        # PRIORITY 3: General Emergency / Obstacle
+        elif is_emergency:
+            msg = f"[EMERGENCY] Careful, {lead['label']} is very close {location}!"
+
+        # PRIORITY 4: Normal Alert (Ask Gemini or use local fallback)
         else:
+            gemini_txt = ask_gemini(frame, f"{lead['label']} {location}, {dist_str}")
+            if gemini_txt:
+                msg = f"[ALERT] {gemini_txt}"
+            else:
+                msg = f"[ALERT] Caution, {lead['label']} {location}, {dist_str}."
 
-            msg = (
+        sys.stdout.write(f"\r{' ' * 85}\r\n[{timestamp}] {msg}\n\n")
+        sys.stdout.flush()
 
-                f"[ALERT] Caution, "
-                f"{phrase} "
-                f"{be_verb} "
-                f"{location}"
-                f"{dist_clause}."
-            )
-
-
-    # ========================================================
-    # SAME DISPLAY FORMAT
-    # ========================================================
-
-    sys.stdout.write(
-
-        f"\r{' ' * 85}\r\n"
-        f"[{timestamp}] {msg}\n\n"
-    )
-
-
-    sys.stdout.flush()
-
-
-    # ========================================================
-    # UPDATE ALERT STATE
-    # ========================================================
-
-    last_alert_time = (
-        current_sec
-    )
-
-
-    last_alert_summary = (
-        state_signature
-    )
-
-
-    timeline_records.append({
-
-        "time":
-            timestamp,
-
-        "message":
-            msg
-    })
-
-
-# ============================================================
-# CLEANUP
-# ============================================================
+        last_alert_time = current_sec
+        last_alert_signature = state_sig
+        timeline_records.append({"time": timestamp, "message": msg})
 
 cap.release()
 
-
-print(
-    "\n\n"
-    + "=" * 68
-)
-
-print(
-    " ASSISTIVE SCENE SUMMARY"
-)
-
-print(
-    "=" * 68
-    + "\n"
-)
-
-
+print("\n\n" + "=" * 68)
+print("              HIGH-PRIORITY ASSISTIVE SUMMARY")
+print("=" * 68 + "\n")
 if timeline_records:
-
     for rec in timeline_records:
-
-        print(
-            f" [{rec['time']}] "
-            f"{rec['message']}\n"
-        )
-
+        print(f" [{rec['time']}] {rec['message']}\n")
 else:
-
-    print(
-        " Path remained clear "
-        "throughout navigation.\n"
-    )
-
-
-print(
-    "=" * 68
-    + "\n"
-)
+    print(" Path remained clear throughout navigation.\n")
+print("=" * 68 + "\n")
