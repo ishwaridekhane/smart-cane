@@ -87,6 +87,7 @@ last_alert_time = -10.0
 last_emergency_time = -10.0
 last_gemini_time = -10.0
 last_alert_signature = ""
+path_is_clear = False
 timeline_records = []
 frame_count = 0
 
@@ -260,8 +261,6 @@ while cap.isOpened():
         t for t in tracks.values()
         if (current_sec - t["last_seen"] <= 0.4 and t["frames_seen"] >= MIN_CONFIRMATIONS and (t["box_h"] / frame_h) >= 0.18)
     ]
-    if not visible:
-        continue
 
     # 2. Check if the corridor is blocked by seating or a group ahead
     center_items = [t for t in visible if t["zone"] == "center"]
@@ -279,11 +278,29 @@ while cap.isOpened():
         return False
 
     hazards = [t for t in visible if is_walking_hazard(t)]
-    if not hazards and not is_corridor_blocked:
-        continue
 
-    # 4. Pick leading obstacle
-    hazards.sort(key=lambda t: (t["zone"] == "center", t["box_h"]), reverse=True)
+    # 4. Path is clear logic
+    if not hazards and not is_corridor_blocked:
+        if not path_is_clear:
+            timestamp = format_time(current_sec)
+            msg = "[INFO] Path is clear."
+            sys.stdout.write(f"\r{' ' * 85}\r\n[{timestamp}] {msg}\n\n")
+            sys.stdout.flush()
+            timeline_records.append({"time": timestamp, "message": msg})
+            path_is_clear = True
+        continue
+    else:
+        path_is_clear = False
+
+    # 5. Prioritize tables over chairs in the center lane
+    hazards.sort(
+        key=lambda t: (
+            t["zone"] == "center",
+            t["label"] == "dining table",
+            t["box_h"]
+        ),
+        reverse=True
+    )
     lead = hazards[0] if hazards else center_items[0]
 
     dist_val = lead.get("dist_m")
@@ -305,6 +322,7 @@ while cap.isOpened():
     if should_announce:
         timestamp = format_time(current_sec)
         location = "ahead of you" if lead["zone"] == "center" else f"on your {lead['zone']}"
+        obj_name = "table" if lead["label"] == "dining table" else lead["label"]
 
         # PRIORITY 1: Hallway blocked ahead
         if is_corridor_blocked:
@@ -317,15 +335,15 @@ while cap.isOpened():
 
         # PRIORITY 3: General Emergency / Close Obstacle
         elif is_emergency:
-            msg = f"[EMERGENCY] Careful, {lead['label']} is very close {location}!"
+            msg = f"[EMERGENCY] Careful, {obj_name} is very close {location}!"
 
         # PRIORITY 4: Normal Alert (Ask Gemini or use local fallback)
         else:
-            gemini_txt = ask_gemini(frame, f"{lead['label']} {location}, {dist_str}")
+            gemini_txt = ask_gemini(frame, f"{obj_name} {location}, {dist_str}")
             if gemini_txt:
                 msg = f"[ALERT] {gemini_txt}"
             else:
-                msg = f"[ALERT] Caution, {lead['label']} {location}, {dist_str}."
+                msg = f"[ALERT] Caution, {obj_name} {location}, {dist_str}."
 
         sys.stdout.write(f"\r{' ' * 85}\r\n[{timestamp}] {msg}\n\n")
         sys.stdout.flush()
