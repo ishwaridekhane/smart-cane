@@ -3,8 +3,12 @@ import os
 import sys
 import math
 import time
+import logging
 from collections import deque
 from ultralytics import YOLO
+
+# Silence Google GenAI SDK logging warnings
+logging.getLogger("google_genai").setLevel(logging.ERROR)
 
 # ============================================================
 # CONFIGURATION
@@ -24,7 +28,7 @@ MAX_TRACK_DISTANCE = 110
 MAX_TRACK_AGE = 0.8
 MIN_CONFIRMATIONS = 2
 
-# Walking Corridor (Center 36% of the view)
+# Walking Corridor (Center lane boundaries)
 LEFT_BOUNDARY = 0.32
 RIGHT_BOUNDARY = 0.68
 HYSTERESIS_RATIO = 0.04
@@ -33,7 +37,7 @@ ALLOWED_OBSTACLES = {
     "person", "bicycle", "car", "motorcycle", "bus", "truck", "dog", "chair", "dining table"
 }
 
-# Real-world object reference heights in meters (Height is more stable than width)
+# Height-based real-world measurements for stable distance estimation
 AVERAGE_HEIGHTS = {
     "person": 1.70, "bicycle": 1.00, "motorcycle": 1.10,
     "car": 1.50, "bus": 3.00, "truck": 3.00, "dog": 0.50,
@@ -109,8 +113,10 @@ def get_zone(x, previous_zone=None):
     if previous_zone == "left":
         return "left" if x < (b1 + hysteresis_margin) else ("right" if x > b2 else "center")
     elif previous_zone == "center":
-        if x < (b1 - hysteresis_margin): return "left"
-        if x > (b2 + hysteresis_margin): return "right"
+        if x < (b1 - hysteresis_margin):
+            return "left"
+        if x > (b2 + hysteresis_margin):
+            return "right"
         return "center"
     elif previous_zone == "right":
         return "right" if x > (b2 - hysteresis_margin) else ("left" if x < b1 else "center")
@@ -129,14 +135,22 @@ def ask_gemini(frame, prompt_context):
         small_frame = cv2.resize(frame, (320, 240))
         _, encoded = cv2.imencode(".jpg", small_frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
 
-        prompt = f"""You are an assistive voice for a blind person walking indoors.
+        prompt = f"""You are the voice of a smart cane for a visually impaired user.
 Obstacle data: {prompt_context}
 State what is directly blocking them or if they must turn. Keep it to 1 calm sentence under 12 words."""
 
         response = gemini_client.models.generate_content(
             model="gemini-2.5-flash",
             contents=[types.Part.from_bytes(data=encoded.tobytes(), mime_type="image/jpeg"), prompt],
-            config=types.GenerateContentConfig(temperature=0.1, max_output_tokens=30)
+            config=types.GenerateContentConfig(
+                temperature=0.1,
+                max_output_tokens=30,
+                tool_config=types.ToolConfig(
+                    function_calling_config=types.FunctionCallingConfig(
+                        mode=types.FunctionCallingConfigMode.NONE
+                    )
+                )
+            )
         )
         last_gemini_time = now
         if response.text:
@@ -241,7 +255,7 @@ while cap.isOpened():
 
     match_detections(detections, current_sec)
 
-    # 1. Filter out far background objects (height >= 18% of frame)
+    # 1. Filter background clutter (height >= 18% of frame)
     visible = [
         t for t in tracks.values()
         if (current_sec - t["last_seen"] <= 0.4 and t["frames_seen"] >= MIN_CONFIRMATIONS and (t["box_h"] / frame_h) >= 0.18)
@@ -249,17 +263,16 @@ while cap.isOpened():
     if not visible:
         continue
 
-    # 2. Check if the hallway/corridor is blocked by seating or a group ahead
+    # 2. Check if the corridor is blocked by seating or a group ahead
     center_items = [t for t in visible if t["zone"] == "center"]
     has_table = any(t["label"] in ["dining table", "chair"] for t in center_items)
     people_in_center = sum(1 for t in center_items if t["label"] == "person")
     is_corridor_blocked = (has_table and people_in_center >= 2) or (people_in_center >= 3)
 
-    # 3. Check for hazards: objects in center OR side furniture sticking into the path
+    # 3. Detect items in the walking lane or side furniture sticking into it
     def is_walking_hazard(t):
         if t["zone"] == "center":
             return True
-        # Side chair/table sticking its edges across the corridor line
         if t["label"] in ["chair", "dining table"]:
             if (t["x2"] > b1 and t["x1"] < b2) and (t["box_h"] / frame_h >= 0.22):
                 return True
@@ -302,7 +315,7 @@ while cap.isOpened():
             steer = "right" if lead["zone"] == "left" else "left"
             msg = f"[ALERT] Caution, chair sticking out on your {lead['zone']}, step {steer}."
 
-        # PRIORITY 3: General Emergency / Obstacle
+        # PRIORITY 3: General Emergency / Close Obstacle
         elif is_emergency:
             msg = f"[EMERGENCY] Careful, {lead['label']} is very close {location}!"
 
