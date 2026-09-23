@@ -202,6 +202,8 @@ def match_detections(detections, current_sec):
         if best_id is not None and min_d <= MAX_TRACK_DISTANCE:
             trk = tracks[best_id]
             trk["x"], trk["y"] = det["x"], det["y"]
+            trk["x1"] = det["x"] - det["box_w"] / 2
+            trk["x2"] = det["x"] + det["box_w"] / 2
             trk["box_h"], trk["box_w"] = det["box_h"], det["box_w"]
             trk["dist_m"] = dist_m
             trk["last_seen"] = current_sec
@@ -219,6 +221,8 @@ def match_detections(detections, current_sec):
                 "label": det["label"],
                 "x": det["x"],
                 "y": det["y"],
+                "x1": det["x"] - det["box_w"] / 2,
+                "x2": det["x"] + det["box_w"] / 2,
                 "box_h": det["box_h"],
                 "box_w": det["box_w"],
                 "dist_m": dist_m,
@@ -288,26 +292,42 @@ while cap.isOpened():
     if not visible:
         continue
 
-    # Prioritize obstacles directly in the central walking path
-    visible.sort(key=lambda t: (t["zone"] == "center", t["box_h"]), reverse=True)
-    lead = visible[0]
+    # 1. Check if hallway ahead is blocked by group and table
+    center_items = [t for t in visible if t["zone"] == "center"]
+    has_table = any(t["label"] in ["dining table", "chair"] for t in center_items)
+    people_in_center = sum(1 for t in center_items if t["label"] == "person")
+    is_hallway_blocked = (has_table and people_in_center >= 2) or (people_in_center >= 3)
 
-    # Ignore furniture sitting safely on the sides out of the walking lane
-    if lead["label"] in ["chair", "dining table"] and lead["zone"] != "center":
+    # 2. Check if side chairs stick into walking corridor
+    def sticks_into_lane(trk):
+        if trk["label"] not in ["chair", "dining table"]:
+            return True
+        if trk["zone"] == "center":
+            return True
+        # If chair is close and its edges cross into the central lane
+        if trk["proximity"] == "near" and (trk.get("x2", 0) > b1 and trk.get("x1", 0) < b2):
+            return True
+        return False
+
+    valid_hazards = [t for t in visible if sticks_into_lane(t)]
+    if not valid_hazards and not is_hallway_blocked:
         continue
+
+    valid_hazards.sort(key=lambda t: (t["zone"] == "center", t["box_h"]), reverse=True)
+    lead = valid_hazards[0] if valid_hazards else center_items[0]
 
     emergency_now = (lead["zone"] == "center" and lead["proximity"] == "near")
     emergency_allowed = (current_sec - last_emergency_time >= EMERGENCY_COOLDOWN)
     cooldown_expired = (current_sec - last_alert_time >= ALERT_COOLDOWN)
 
-    zone_members = [t for t in visible if t["label"] == lead["label"] and t["zone"] == lead["zone"]]
+    zone_members = [t for t in valid_hazards if t["label"] == lead["label"] and t["zone"] == lead["zone"]]
     count = len(zone_members)
     phrase = natural_phrase(lead["label"], count)
     movement = get_movement(lead["history"])
     dist_val = lead.get("dist_m")
     dist_str = f"about {dist_val} meters" if dist_val else ""
 
-    state_signature = f"{phrase}_{lead['zone']}_{dist_val}_{lead['proximity']}"
+    state_signature = f"{phrase}_{lead['zone']}_{dist_val}_{is_hallway_blocked}"
 
     should_announce = False
     if emergency_now and emergency_allowed:
@@ -325,6 +345,7 @@ while cap.isOpened():
             "location": location,
             "distance": dist_str,
             "motion": movement,
+            "hallway_blocked": is_hallway_blocked,
             "emergency": emergency_now
         }
         gemini_msg = ask_gemini(frame, detected_context)
@@ -334,8 +355,14 @@ while cap.isOpened():
         else:
             dist_clause = f" {dist_str}" if dist_str else ""
             be_verb = "is" if count == 1 else "are"
-            if emergency_now:
-                msg = f"[EMERGENCY] Careful, {phrase} {be_verb} very close {location}{dist_clause}, {movement}!"
+
+            if is_hallway_blocked:
+                msg = "[ALERT] Path blocked ahead by table and group. Turn left or right to go around."
+            elif lead["zone"] != "center" and lead["label"] == "chair":
+                steer_dir = "right" if lead["zone"] == "left" else "left"
+                msg = f"[ALERT] Caution, chair sticking out on your {lead['zone']}, step {steer_dir}."
+            elif emergency_now:
+                msg = f"[EMERGENCY] Careful, {phrase} {be_verb} very close {location}{dist_clause}!"
             else:
                 msg = f"[ALERT] Caution, {phrase} {be_verb} {location}{dist_clause}."
 
