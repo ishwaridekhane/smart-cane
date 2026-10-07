@@ -1,9 +1,7 @@
 import cv2
 import time
-import os
 import sys
 from collections import defaultdict, deque
-
 from ultralytics import YOLO
 
 
@@ -12,19 +10,13 @@ from ultralytics import YOLO
 # ============================================================
 
 MODEL_PATH = "yolov8n.pt"
-
 DEFAULT_URL = "http://10.108.217.59:8080/video"
 
 IMG_SIZE = 384
 CONFIDENCE = 0.45
 FRAME_SKIP = 3
+MESSAGE_COOLDOWN = 2.0
 
-# Gemini
-GEMINI_MODEL = "gemini-3.8-flash"
-GEMINI_COOLDOWN = 5
-
-
-# Objects useful for navigation
 NAV_OBJECTS = {
     "person",
     "bicycle",
@@ -42,30 +34,7 @@ NAV_OBJECTS = {
 
 
 # ============================================================
-# GEMINI
-# ============================================================
-
-gemini_client = None
-last_gemini_call = 0
-
-try:
-    from google import genai
-
-    api_key = os.getenv("GEMINI_API_KEY")
-
-    if api_key:
-        gemini_client = genai.Client(api_key=api_key)
-        print("[GEMINI] API key found.")
-        print(f"[GEMINI] Model: {GEMINI_MODEL}")
-    else:
-        print("[GEMINI] API key not found. Gemini disabled.")
-
-except Exception as e:
-    print("[GEMINI] Could not initialize:", e)
-
-
-# ============================================================
-# TRACKING
+# MOVEMENT TRACKING
 # ============================================================
 
 tracks = defaultdict(lambda: deque(maxlen=6))
@@ -74,14 +43,13 @@ tracks = defaultdict(lambda: deque(maxlen=6))
 def get_movement(name, cx, cy):
 
     history = tracks[name]
-
-    history.append((cx, cy, time.time()))
+    history.append((cx, cy))
 
     if len(history) < 4:
         return "stationary"
 
-    old_x, old_y, _ = history[0]
-    new_x, new_y, _ = history[-1]
+    old_x, old_y = history[0]
+    new_x, new_y = history[-1]
 
     dx = new_x - old_x
     dy = new_y - old_y
@@ -90,23 +58,16 @@ def get_movement(name, cx, cy):
         return "stationary"
 
     if abs(dx) > abs(dy):
+        return "moving right" if dx > 0 else "moving left"
 
-        if dx > 0:
-            return "moving right"
-
-        return "moving left"
-
-    if dy > 10:
+    if dy > 12:
         return "approaching"
 
-    if dy < -10:
-        return "moving away"
-
-    return "moving"
+    return "moving away"
 
 
 # ============================================================
-# DIRECTION
+# LEFT / AHEAD / RIGHT
 # ============================================================
 
 def get_direction(cx, width):
@@ -123,15 +84,13 @@ def get_direction(cx, width):
 
 
 # ============================================================
-# DISTANCE
+# APPROXIMATE DISTANCE
 # ============================================================
 
-def estimate_distance_band(box_height, frame_height, name):
+def get_distance(box_height, frame_height, name):
 
     ratio = box_height / frame_height
 
-    # For people, a large bounding box means the person
-    # is physically close to the camera.
     if name == "person":
 
         if ratio >= 0.72:
@@ -151,7 +110,7 @@ def estimate_distance_band(box_height, frame_height, name):
 
         return "far"
 
-    # General objects
+    # Other objects
     if ratio >= 0.55:
         return "very close"
 
@@ -171,86 +130,16 @@ def estimate_distance_band(box_height, frame_height, name):
 
 
 # ============================================================
-# GEMINI
+# NAVIGATION MESSAGE
 # ============================================================
 
-def ask_gemini(detections, walking):
-
-    global last_gemini_call
-
-    if gemini_client is None:
-        return None
-
-    now = time.time()
-
-    if now - last_gemini_call < GEMINI_COOLDOWN:
-        return None
-
-    last_gemini_call = now
-
-    scene = []
-
-    for d in detections[:6]:
-
-        scene.append(
-            f"{d['name']} on {d['direction']}, "
-            f"{d['distance']}, {d['movement']}"
-        )
-
-    scene_text = "\n".join(scene)
-
-    mode = "walking" if walking else "sitting/testing"
-
-    prompt = f"""
-You are the contextual AI for an accessibility smart cane.
-
-Detected scene:
-{scene_text}
-
-User mode: {mode}
-
-Give ONE short voice instruction for the user.
-
-Rules:
-- Use ONLY detected objects.
-- Never invent anything.
-- Never change the detected direction.
-- Keep it under 12 words.
-- Use simple natural language.
-- Say ahead, left, or right.
-- Do not mention AI, YOLO, pixels, bounding boxes,
-  confidence, or computer vision.
-"""
-
-    try:
-
-        response = gemini_client.models.generate_content(
-            model=GEMINI_MODEL,
-            contents=prompt
-        )
-
-        answer = response.text.strip()
-
-        if answer:
-            return answer
-
-    except Exception as e:
-        print("[GEMINI ERROR]", e)
-
-    return None
-
-
-# ============================================================
-# LOCAL SAFETY LOGIC
-# ============================================================
-
-def create_message(detections, walking):
+def navigation_message(detections, walking):
 
     if not detections:
         return None, False
 
     # --------------------------------------------------------
-    # PERSON AHEAD
+    # PERSON AHEAD = HIGHEST PRIORITY
     # --------------------------------------------------------
 
     people_ahead = [
@@ -261,44 +150,27 @@ def create_message(detections, walking):
 
     if people_ahead:
 
-        person = min(
+        person = max(
             people_ahead,
-            key=lambda x: x["box_height"],
-            reverse=True
+            key=lambda d: d["box_height"]
         )
 
-        distance = person["distance"]
-        movement = person["movement"]
-
-        if distance == "very close":
-
+        if person["distance"] == "very close":
             return (
                 "Person very close ahead. Be careful.",
                 True
             )
 
-        if movement == "approaching":
-
+        if person["movement"] == "approaching":
             return (
-                f"Person ahead, {distance}, moving toward you. "
-                f"Be careful.",
+                f"Person ahead, {person['distance']}, "
+                f"moving toward you. Be careful.",
                 True
             )
 
         return (
-            f"Person ahead, {distance}.",
+            f"Person ahead, {person['distance']}.",
             False
-        )
-
-    # --------------------------------------------------------
-    # MULTIPLE PEOPLE
-    # --------------------------------------------------------
-
-    if len(people_ahead) >= 2:
-
-        return (
-            f"{len(people_ahead)} people ahead. Be careful.",
-            True
         )
 
     # --------------------------------------------------------
@@ -314,17 +186,23 @@ def create_message(detections, walking):
 
         obj = max(
             objects_ahead,
-            key=lambda x: x["box_height"]
+            key=lambda d: d["box_height"]
         )
+
+        if obj["distance"] == "very close":
+            return (
+                f"{obj['name'].capitalize()} very close ahead.",
+                True
+            )
 
         return (
             f"{obj['name'].capitalize()} ahead, "
             f"{obj['distance']}.",
-            True
+            False
         )
 
     # --------------------------------------------------------
-    # CLOSE OBJECT ON SIDE
+    # CLOSE SIDE OBJECT
     # --------------------------------------------------------
 
     side_objects = [
@@ -341,7 +219,7 @@ def create_message(detections, walking):
 
         obj = max(
             side_objects,
-            key=lambda x: x["box_height"]
+            key=lambda d: d["box_height"]
         )
 
         return (
@@ -366,10 +244,10 @@ def main():
     )
 
     print()
-    print("=" * 60)
+    print("=" * 55)
     print("SAHAYAK DRISHTI AI")
-    print("PHONE CAMERA NAVIGATION")
-    print("=" * 60)
+    print("PHONE NAVIGATION")
+    print("=" * 55)
     print()
 
     # --------------------------------------------------------
@@ -388,13 +266,12 @@ def main():
         if mode in ("s", "w"):
             break
 
+        print("Enter s or w.")
+
     walking = mode == "w"
 
     print()
-    print(
-        "[MODE]",
-        "Walking" if walking else "Sitting / Testing"
-    )
+    print("[MODE]", "Walking" if walking else "Sitting / Testing")
     print()
 
     # --------------------------------------------------------
@@ -406,7 +283,6 @@ def main():
     model = YOLO(MODEL_PATH)
 
     print("[YOLO] Model loaded.")
-    print()
 
     # --------------------------------------------------------
     # CAMERA
@@ -415,36 +291,25 @@ def main():
     print("[CAMERA] Connecting to phone...")
 
     cap = cv2.VideoCapture(video_url)
-
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
     if not cap.isOpened():
-
         print("[ERROR] Could not connect to phone camera.")
         return
 
     print("[CAMERA] Connected.")
     print()
-
-    # --------------------------------------------------------
-    # STATE
-    # --------------------------------------------------------
+    print("=" * 55)
+    print("NAVIGATION STARTED")
+    print("=" * 55)
+    print()
 
     frame_number = 0
 
     last_message = ""
     last_message_time = 0
 
-    MESSAGE_COOLDOWN = 2.0
-
-    path_was_blocked = False
-
-    print("=" * 60)
-    print("NAVIGATION STARTED")
-    print("=" * 60)
-    print()
-    print("Press Q to stop.")
-    print()
+    path_blocked = False
 
     # ========================================================
     # LOOP
@@ -455,7 +320,6 @@ def main():
         ret, frame = cap.read()
 
         if not ret:
-
             print("[CAMERA] Frame lost.")
             time.sleep(0.2)
             continue
@@ -469,10 +333,7 @@ def main():
         # Resize
         # ----------------------------------------------------
 
-        display = cv2.resize(
-            frame,
-            (640, 360)
-        )
+        display = cv2.resize(frame, (640, 360))
 
         height, width = display.shape[:2]
 
@@ -502,7 +363,6 @@ def main():
                     continue
 
                 class_id = int(box.cls[0])
-
                 name = model.names[class_id]
 
                 if name not in NAV_OBJECTS:
@@ -523,7 +383,7 @@ def main():
                     width
                 )
 
-                distance = estimate_distance_band(
+                distance = get_distance(
                     box_height,
                     height,
                     name
@@ -549,16 +409,7 @@ def main():
                 })
 
         # ----------------------------------------------------
-        # SAFETY MESSAGE
-        # ----------------------------------------------------
-
-        local_message, emergency = create_message(
-            detections,
-            walking
-        )
-
-        # ----------------------------------------------------
-        # PATH STATE
+        # PATH
         # ----------------------------------------------------
 
         blocked = any(
@@ -567,44 +418,28 @@ def main():
             for d in detections
         )
 
-        # Only say "Path is clear" after it was blocked.
-        if path_was_blocked and not blocked:
+        # Say clear ONLY after previously blocked.
+        if path_blocked and not blocked:
 
             now = time.time()
 
             if now - last_message_time > MESSAGE_COOLDOWN:
 
-                print(
-                    f"[{time.strftime('%M:%S')}] "
-                    "[INFO] Path is clear."
-                )
+                print("[INFO] Path is clear.")
 
                 last_message = "Path is clear."
                 last_message_time = now
 
-        path_was_blocked = blocked
+        path_blocked = blocked
 
         # ----------------------------------------------------
-        # GEMINI
+        # NAVIGATION
         # ----------------------------------------------------
 
-        gemini_message = None
-
-        if detections and not emergency:
-
-            gemini_message = ask_gemini(
-                detections,
-                walking
-            )
-
-        # ----------------------------------------------------
-        # FINAL MESSAGE
-        # ----------------------------------------------------
-
-        message = local_message
-
-        if message is None:
-            message = gemini_message
+        message, emergency = navigation_message(
+            detections,
+            walking
+        )
 
         if message:
 
@@ -621,16 +456,13 @@ def main():
                     else "[INFO]"
                 )
 
-                print(
-                    f"[{time.strftime('%M:%S')}] "
-                    f"{tag} {message}"
-                )
+                print(f"{tag} {message}")
 
                 last_message = message
                 last_message_time = now
 
         # ----------------------------------------------------
-        # DISPLAY
+        # DISPLAY ONLY NECESSARY INFORMATION
         # ----------------------------------------------------
 
         for d in detections:
@@ -641,8 +473,8 @@ def main():
             y2 = int(d["y2"])
 
             label = (
-                f"{d['name']} "
-                f"{d['direction']} "
+                f"{d['name']} | "
+                f"{d['direction']} | "
                 f"{d['distance']}"
             )
 
@@ -657,17 +489,17 @@ def main():
             cv2.putText(
                 display,
                 label,
-                (x1, max(20, y1 - 8)),
+                (x1, max(18, y1 - 7)),
                 cv2.FONT_HERSHEY_SIMPLEX,
                 0.45,
                 (0, 255, 0),
                 1
             )
 
-        # Mode
+        # Only mode at the top.
         cv2.putText(
             display,
-            "WALKING" if walking else "SITTING / TEST",
+            "WALKING" if walking else "SITTING",
             (10, 25),
             cv2.FONT_HERSHEY_SIMPLEX,
             0.6,
@@ -675,24 +507,13 @@ def main():
             2
         )
 
-        # Gemini
-        cv2.putText(
-            display,
-            "Gemini: ON" if gemini_client else "Gemini: OFF",
-            (10, 50),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.5,
-            (255, 255, 255),
-            1
-        )
-
         cv2.imshow(
-            "Sahayak Drishti - Phone Navigation",
+            "Sahayak Drishti",
             display
         )
 
         # ----------------------------------------------------
-        # EXIT
+        # Q = EXIT
         # ----------------------------------------------------
 
         if cv2.waitKey(1) & 0xFF == ord("q"):
@@ -704,10 +525,6 @@ def main():
     print()
     print("Navigation stopped.")
 
-
-# ============================================================
-# START
-# ============================================================
 
 if __name__ == "__main__":
     main()
