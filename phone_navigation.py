@@ -23,18 +23,98 @@ MESSAGE_COOLDOWN = 2.0
 
 # Objects useful for navigation
 NAV_OBJECTS = {
+    # People / animals
     "person",
+    "bird",
+    "cat",
+    "dog",
+    "horse",
+    "sheep",
+    "cow",
+    "elephant",
+    "bear",
+    "zebra",
+    "giraffe",
+
+    # Vehicles
     "bicycle",
     "car",
     "motorcycle",
+    "airplane",
     "bus",
+    "train",
     "truck",
-    "dog",
-    "chair",
+    "boat",
+
+    # Road / outdoor
+    "traffic light",
+    "fire hydrant",
+    "stop sign",
+    "parking meter",
     "bench",
+
+    # Bags / personal items
     "backpack",
+    "umbrella",
+    "handbag",
+    "tie",
     "suitcase",
+
+    # Sports
+    "frisbee",
+    "skis",
+    "snowboard",
+    "sports ball",
+    "kite",
+    "baseball bat",
+    "baseball glove",
+    "skateboard",
+    "surfboard",
+    "tennis racket",
+
+    # Food
+    "bottle",
+    "wine glass",
+    "cup",
+    "fork",
+    "knife",
+    "spoon",
+    "bowl",
+    "banana",
+    "apple",
+    "sandwich",
+    "orange",
+    "broccoli",
+    "carrot",
+    "hot dog",
+    "pizza",
+    "donut",
+    "cake",
+
+    # Furniture / surroundings
+    "chair",
+    "couch",
+    "potted plant",
+    "bed",
     "dining table",
+    "toilet",
+
+    # Electronics
+    "tv",
+    "laptop",
+    "mouse",
+    "remote",
+    "keyboard",
+    "cell phone",
+
+    # Other common objects
+    "book",
+    "clock",
+    "vase",
+    "scissors",
+    "teddy bear",
+    "hair drier",
+    "toothbrush",
 }
 
 
