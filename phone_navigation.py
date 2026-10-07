@@ -6,17 +6,22 @@ from ultralytics import YOLO
 
 
 # ============================================================
-# SAHAYAK DRISHTI AI - PHONE NAVIGATION
+# SAHAYAK DRISHTI AI
+# PHONE CAMERA NAVIGATION
 # ============================================================
 
 MODEL_PATH = "yolov8n.pt"
+
 DEFAULT_URL = "http://10.108.217.59:8080/video"
 
 IMG_SIZE = 384
 CONFIDENCE = 0.45
 FRAME_SKIP = 3
+
 MESSAGE_COOLDOWN = 2.0
 
+
+# Objects useful for navigation
 NAV_OBJECTS = {
     "person",
     "bicycle",
@@ -43,6 +48,7 @@ tracks = defaultdict(lambda: deque(maxlen=6))
 def get_movement(name, cx, cy):
 
     history = tracks[name]
+
     history.append((cx, cy))
 
     if len(history) < 4:
@@ -58,7 +64,11 @@ def get_movement(name, cx, cy):
         return "stationary"
 
     if abs(dx) > abs(dy):
-        return "moving right" if dx > 0 else "moving left"
+
+        if dx > 0:
+            return "moving right"
+
+        return "moving left"
 
     if dy > 12:
         return "approaching"
@@ -67,7 +77,7 @@ def get_movement(name, cx, cy):
 
 
 # ============================================================
-# LEFT / AHEAD / RIGHT
+# DIRECTION
 # ============================================================
 
 def get_direction(cx, width):
@@ -91,6 +101,7 @@ def get_distance(box_height, frame_height, name):
 
     ratio = box_height / frame_height
 
+    # Person
     if name == "person":
 
         if ratio >= 0.72:
@@ -133,13 +144,13 @@ def get_distance(box_height, frame_height, name):
 # NAVIGATION MESSAGE
 # ============================================================
 
-def navigation_message(detections, walking):
+def navigation_message(detections):
 
     if not detections:
         return None, False
 
     # --------------------------------------------------------
-    # PERSON AHEAD = HIGHEST PRIORITY
+    # PERSON AHEAD
     # --------------------------------------------------------
 
     people_ahead = [
@@ -155,21 +166,26 @@ def navigation_message(detections, walking):
             key=lambda d: d["box_height"]
         )
 
-        if person["distance"] == "very close":
+        distance = person["distance"]
+        movement = person["movement"]
+
+        if distance == "very close":
+
             return (
                 "Person very close ahead. Be careful.",
                 True
             )
 
-        if person["movement"] == "approaching":
+        if movement == "approaching":
+
             return (
-                f"Person ahead, {person['distance']}, "
-                f"moving toward you. Be careful.",
+                f"Person ahead, {distance}, "
+                "moving toward you. Be careful.",
                 True
             )
 
         return (
-            f"Person ahead, {person['distance']}.",
+            f"Person ahead, {distance}.",
             False
         )
 
@@ -190,6 +206,7 @@ def navigation_message(detections, walking):
         )
 
         if obj["distance"] == "very close":
+
             return (
                 f"{obj['name'].capitalize()} very close ahead.",
                 True
@@ -202,7 +219,7 @@ def navigation_message(detections, walking):
         )
 
     # --------------------------------------------------------
-    # CLOSE SIDE OBJECT
+    # CLOSE OBJECT ON LEFT / RIGHT
     # --------------------------------------------------------
 
     side_objects = [
@@ -237,6 +254,7 @@ def navigation_message(detections, walking):
 
 def main():
 
+    # Use URL from command line if provided
     video_url = (
         sys.argv[1]
         if len(sys.argv) > 1
@@ -246,7 +264,7 @@ def main():
     print()
     print("=" * 55)
     print("SAHAYAK DRISHTI AI")
-    print("PHONE NAVIGATION")
+    print("PHONE CAMERA NAVIGATION")
     print("=" * 55)
     print()
 
@@ -266,265 +284,242 @@ def main():
         if mode in ("s", "w"):
             break
 
-        print("Enter s or w.")
-
-    walking = mode == "w"
+        print("Please enter s or w.")
 
     print()
-    print("[MODE]", "Walking" if walking else "Sitting / Testing")
+
+    if mode == "w":
+        print("[MODE] Walking")
+    else:
+        print("[MODE] Sitting / Testing")
+
     print()
 
     # --------------------------------------------------------
-    # YOLO
+    # LOAD YOLO
     # --------------------------------------------------------
 
     print("[YOLO] Loading model...")
 
-    model = YOLO(MODEL_PATH)
+    try:
+        model = YOLO(MODEL_PATH)
+    except Exception as e:
+        print("[YOLO ERROR]", e)
+        return
 
     print("[YOLO] Model loaded.")
+    print()
 
     # --------------------------------------------------------
-    # CAMERA
+    # CONNECT PHONE
     # --------------------------------------------------------
 
     print("[CAMERA] Connecting to phone...")
 
     cap = cv2.VideoCapture(video_url)
+
     cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
     if not cap.isOpened():
+
         print("[ERROR] Could not connect to phone camera.")
         return
 
     print("[CAMERA] Connected.")
     print()
+
     print("=" * 55)
     print("NAVIGATION STARTED")
     print("=" * 55)
     print()
+    print("Press Ctrl+C to stop.")
+    print()
+
+    # --------------------------------------------------------
+    # STATE
+    # --------------------------------------------------------
 
     frame_number = 0
 
     last_message = ""
     last_message_time = 0
 
-    path_blocked = False
+    path_was_blocked = False
 
     # ========================================================
-    # LOOP
+    # MAIN LOOP
     # ========================================================
 
-    while True:
+    try:
 
-        ret, frame = cap.read()
+        while True:
 
-        if not ret:
-            print("[CAMERA] Frame lost.")
-            time.sleep(0.2)
-            continue
+            ret, frame = cap.read()
 
-        frame_number += 1
+            if not ret:
 
-        if frame_number % FRAME_SKIP != 0:
-            continue
-
-        # ----------------------------------------------------
-        # Resize
-        # ----------------------------------------------------
-
-        display = cv2.resize(frame, (640, 360))
-
-        height, width = display.shape[:2]
-
-        # ----------------------------------------------------
-        # YOLO
-        # ----------------------------------------------------
-
-        results = model(
-            display,
-            imgsz=IMG_SIZE,
-            conf=CONFIDENCE,
-            verbose=False
-        )
-
-        detections = []
-
-        for result in results:
-
-            if result.boxes is None:
+                print("[CAMERA] Frame lost. Waiting...")
+                time.sleep(0.2)
                 continue
 
-            for box in result.boxes:
+            frame_number += 1
 
-                confidence = float(box.conf[0])
+            # Process every 3rd frame
+            if frame_number % FRAME_SKIP != 0:
+                continue
 
-                if confidence < CONFIDENCE:
-                    continue
+            # ------------------------------------------------
+            # Resize for faster processing
+            # ------------------------------------------------
 
-                class_id = int(box.cls[0])
-                name = model.names[class_id]
-
-                if name not in NAV_OBJECTS:
-                    continue
-
-                x1, y1, x2, y2 = box.xyxy[0].tolist()
-
-                box_height = y2 - y1
-
-                if box_height < 18:
-                    continue
-
-                cx = (x1 + x2) / 2
-                cy = (y1 + y2) / 2
-
-                direction = get_direction(
-                    cx,
-                    width
-                )
-
-                distance = get_distance(
-                    box_height,
-                    height,
-                    name
-                )
-
-                movement = get_movement(
-                    name,
-                    cx,
-                    cy
-                )
-
-                detections.append({
-                    "name": name,
-                    "confidence": confidence,
-                    "x1": x1,
-                    "y1": y1,
-                    "x2": x2,
-                    "y2": y2,
-                    "box_height": box_height,
-                    "direction": direction,
-                    "distance": distance,
-                    "movement": movement
-                })
-
-        # ----------------------------------------------------
-        # PATH
-        # ----------------------------------------------------
-
-        blocked = any(
-            d["direction"] == "ahead"
-            and d["distance"] != "far"
-            for d in detections
-        )
-
-        # Say clear ONLY after previously blocked.
-        if path_blocked and not blocked:
-
-            now = time.time()
-
-            if now - last_message_time > MESSAGE_COOLDOWN:
-
-                print("[INFO] Path is clear.")
-
-                last_message = "Path is clear."
-                last_message_time = now
-
-        path_blocked = blocked
-
-        # ----------------------------------------------------
-        # NAVIGATION
-        # ----------------------------------------------------
-
-        message, emergency = navigation_message(
-            detections,
-            walking
-        )
-
-        if message:
-
-            now = time.time()
-
-            if (
-                message != last_message
-                or now - last_message_time > MESSAGE_COOLDOWN
-            ):
-
-                tag = (
-                    "[EMERGENCY]"
-                    if emergency
-                    else "[INFO]"
-                )
-
-                print(f"{tag} {message}")
-
-                last_message = message
-                last_message_time = now
-
-        # ----------------------------------------------------
-        # DISPLAY ONLY NECESSARY INFORMATION
-        # ----------------------------------------------------
-
-        for d in detections:
-
-            x1 = int(d["x1"])
-            y1 = int(d["y1"])
-            x2 = int(d["x2"])
-            y2 = int(d["y2"])
-
-            label = (
-                f"{d['name']} | "
-                f"{d['direction']} | "
-                f"{d['distance']}"
+            frame = cv2.resize(
+                frame,
+                (640, 360)
             )
 
-            cv2.rectangle(
-                display,
-                (x1, y1),
-                (x2, y2),
-                (0, 255, 0),
-                2
+            height, width = frame.shape[:2]
+
+            # ------------------------------------------------
+            # YOLO DETECTION
+            # ------------------------------------------------
+
+            results = model(
+                frame,
+                imgsz=IMG_SIZE,
+                conf=CONFIDENCE,
+                verbose=False
             )
 
-            cv2.putText(
-                display,
-                label,
-                (x1, max(18, y1 - 7)),
-                cv2.FONT_HERSHEY_SIMPLEX,
-                0.45,
-                (0, 255, 0),
-                1
+            detections = []
+
+            for result in results:
+
+                if result.boxes is None:
+                    continue
+
+                for box in result.boxes:
+
+                    confidence = float(box.conf[0])
+
+                    if confidence < CONFIDENCE:
+                        continue
+
+                    class_id = int(box.cls[0])
+
+                    name = model.names[class_id]
+
+                    # Ignore irrelevant COCO objects
+                    if name not in NAV_OBJECTS:
+                        continue
+
+                    x1, y1, x2, y2 = box.xyxy[0].tolist()
+
+                    box_height = y2 - y1
+
+                    # Ignore tiny detections
+                    if box_height < 18:
+                        continue
+
+                    center_x = (x1 + x2) / 2
+                    center_y = (y1 + y2) / 2
+
+                    direction = get_direction(
+                        center_x,
+                        width
+                    )
+
+                    distance = get_distance(
+                        box_height,
+                        height,
+                        name
+                    )
+
+                    movement = get_movement(
+                        name,
+                        center_x,
+                        center_y
+                    )
+
+                    detections.append({
+                        "name": name,
+                        "confidence": confidence,
+                        "box_height": box_height,
+                        "direction": direction,
+                        "distance": distance,
+                        "movement": movement
+                    })
+
+            # ------------------------------------------------
+            # PATH STATUS
+            # ------------------------------------------------
+
+            path_blocked = any(
+                d["direction"] == "ahead"
+                and d["distance"] != "far"
+                for d in detections
             )
 
-        # Only mode at the top.
-        cv2.putText(
-            display,
-            "WALKING" if walking else "SITTING",
-            (10, 25),
-            cv2.FONT_HERSHEY_SIMPLEX,
-            0.6,
-            (255, 255, 255),
-            2
-        )
+            # Only announce clear after a previous blockage
+            if path_was_blocked and not path_blocked:
 
-        cv2.imshow(
-            "Sahayak Drishti",
-            display
-        )
+                now = time.time()
 
-        # ----------------------------------------------------
-        # Q = EXIT
-        # ----------------------------------------------------
+                if now - last_message_time > MESSAGE_COOLDOWN:
 
-        if cv2.waitKey(1) & 0xFF == ord("q"):
-            break
+                    print("[INFO] Path is clear.")
 
-    cap.release()
-    cv2.destroyAllWindows()
+                    last_message = "Path is clear."
+                    last_message_time = now
 
-    print()
-    print("Navigation stopped.")
+            path_was_blocked = path_blocked
 
+            # ------------------------------------------------
+            # NAVIGATION
+            # ------------------------------------------------
+
+            message, emergency = navigation_message(
+                detections
+            )
+
+            if message:
+
+                now = time.time()
+
+                # Prevent constant repetition
+                if (
+                    message != last_message
+                    or now - last_message_time
+                    > MESSAGE_COOLDOWN
+                ):
+
+                    if emergency:
+                        print(
+                            f"[EMERGENCY] {message}"
+                        )
+                    else:
+                        print(
+                            f"[INFO] {message}"
+                        )
+
+                    last_message = message
+                    last_message_time = now
+
+    except KeyboardInterrupt:
+
+        print()
+        print("[SYSTEM] Stopping navigation...")
+
+    finally:
+
+        cap.release()
+
+        print("[SYSTEM] Camera released.")
+        print("[SYSTEM] Navigation stopped.")
+
+
+# ============================================================
+# START
+# ============================================================
 
 if __name__ == "__main__":
     main()
