@@ -1,77 +1,29 @@
 import cv2
 import sys
-import math
 import time
-from collections import deque
+import math
 from ultralytics import YOLO
-
-# ============================================================
-# SAHAYAK DRISHTI - PHONE WEBCAM NAVIGATION
-# ============================================================
-# Camera source:
-# Android phone -> IP Webcam -> Wi-Fi -> Raspberry Pi
-#
-# Modes:
-#   Sitting -> identify useful objects only
-#   Walking -> navigation + distance + movement + warnings
-#
-# Model:
-#   yolov8n.pt
-#
-# IMPORTANT:
-# Standard YOLOv8n COCO does NOT detect:
-#   door, headphones, hand, face
-# as separate classes.
-# ============================================================
-
 
 # ============================================================
 # CONFIGURATION
 # ============================================================
 
 MODEL_PATH = "yolov8n.pt"
+PHONE_URL = sys.argv[1] if len(sys.argv) > 1 else None
 
-PHONE_URL = (
-    sys.argv[1]
-    if len(sys.argv) > 1
-    else None
-)
+# FAST SETTINGS FOR RASPBERRY PI 4
+YOLO_SIZE = 320
+CONFIDENCE = 0.40
+FRAME_SKIP = 4
 
-IMG_SIZE = 640
+ALERT_COOLDOWN = 2.0
 
-# Slightly lower than old 0.45, but confirmation prevents
-# one weak detection from immediately becoming an alert.
-CONFIDENCE = 0.35
+LEFT_BOUNDARY = 0.33
+RIGHT_BOUNDARY = 0.67
 
-FRAME_SKIP = 2
+FOCAL_LENGTH_PIXELS = 350.0
 
-# Normal alerts
-ALERT_COOLDOWN = 3.0
-
-# Emergency alerts
-EMERGENCY_COOLDOWN = 2.0
-
-# Detection must survive several processed frames
-MIN_CONFIRMATIONS = 3
-
-# Tracking
-MAX_TRACK_DISTANCE = 130
-MAX_TRACK_AGE = 1.0
-
-# Movement history
-MOVEMENT_HISTORY = 8
-
-MIN_HORIZONTAL_MOVEMENT = 40
-MIN_VERTICAL_MOVEMENT = 30
-
-# Distance change threshold
-MIN_DISTANCE_CHANGE = 0.25
-
-# Walking corridor
-LEFT_BOUNDARY = 0.32
-RIGHT_BOUNDARY = 0.68
-
-# Objects useful for this project
+# Objects useful for navigation
 ALLOWED_OBJECTS = {
     "person",
     "bicycle",
@@ -86,8 +38,6 @@ ALLOWED_OBJECTS = {
     "dining table",
     "bench",
     "backpack",
-    "umbrella",
-    "handbag",
     "suitcase",
     "bottle",
     "cup",
@@ -98,13 +48,11 @@ ALLOWED_OBJECTS = {
     "cell phone",
     "remote",
     "tv",
-    "clock",
-    "potted plant"
+    "potted plant",
 }
 
-# Approximate real-world heights.
-# These are only rough estimates.
-AVERAGE_HEIGHTS = {
+# Approximate real-world heights
+OBJECT_HEIGHTS = {
     "person": 1.70,
     "bicycle": 1.00,
     "motorcycle": 1.10,
@@ -118,8 +66,6 @@ AVERAGE_HEIGHTS = {
     "dining table": 0.75,
     "bench": 0.50,
     "backpack": 0.45,
-    "umbrella": 0.90,
-    "handbag": 0.30,
     "suitcase": 0.70,
     "bottle": 0.25,
     "cup": 0.12,
@@ -130,1183 +76,376 @@ AVERAGE_HEIGHTS = {
     "cell phone": 0.15,
     "remote": 0.15,
     "tv": 0.70,
-    "clock": 0.30,
-    "potted plant": 0.50
+    "potted plant": 0.50,
 }
 
-FOCAL_LENGTH_PIXELS = 650.0
+# ============================================================
+# FUNCTIONS
+# ============================================================
+
+def get_direction(x_center, frame_width):
+    ratio = x_center / frame_width
+
+    if ratio < LEFT_BOUNDARY:
+        return "left"
+    elif ratio > RIGHT_BOUNDARY:
+        return "right"
+    else:
+        return "ahead"
+
+
+def estimate_distance(object_name, box_height):
+    if box_height <= 0:
+        return None
+
+    real_height = OBJECT_HEIGHTS.get(object_name)
+
+    if real_height is None:
+        return None
+
+    distance = (real_height * FOCAL_LENGTH_PIXELS) / box_height
+
+    # Keep the result sensible
+    distance = max(0.5, min(distance, 10.0))
+
+    return distance
+
+
+def distance_text(distance):
+    if distance is None:
+        return ""
+
+    if distance < 1.5:
+        return "about 1 meter"
+    elif distance < 2.5:
+        return "about 2 meters"
+    elif distance < 3.5:
+        return "about 3 meters"
+    elif distance < 5:
+        return "about 4 meters"
+    elif distance < 7:
+        return "about 6 meters"
+    else:
+        return "about 10 meters"
+
+
+def get_position_message(name, direction):
+    if direction == "ahead":
+        return f"{name} ahead."
+    else:
+        return f"{name} on your {direction}."
+
+
+def get_walking_message(name, direction, distance):
+    d_text = distance_text(distance)
+
+    if d_text:
+        if direction == "ahead":
+            return f"{name} ahead, {d_text}."
+        else:
+            return f"{name} on your {direction}, {d_text}."
+
+    return get_position_message(name, direction)
+
+
+def is_dangerous(name, direction, distance):
+    """
+    Conservative walking-mode safety rule.
+    """
+
+    # Anything directly ahead and close
+    if direction == "ahead" and distance is not None and distance <= 1.5:
+        return True
+
+    # People ahead are important even when slightly farther
+    if name == "person" and direction == "ahead" and distance is not None:
+        if distance <= 3.0:
+            return True
+
+    # Vehicles/bicycles ahead
+    if name in {"bicycle", "motorcycle", "car", "bus", "truck"}:
+        if direction == "ahead" and distance is not None and distance <= 3.0:
+            return True
+
+    return False
 
 
 # ============================================================
-# PHONE URL CHECK
+# START
 # ============================================================
 
-if not PHONE_URL:
+print()
+print("============================================================")
+print("              SAHAYAK DRISHTI AI")
+print("             FAST PHONE NAVIGATION")
+print("============================================================")
+print()
 
-    print("=" * 68)
-    print("              SAHAYAK DRISHTI")
-    print("           PHONE NAVIGATION MODE")
-    print("=" * 68)
-
-    print("\n[ERROR] Phone camera URL was not provided.")
-
-    print("\nRun:")
-    print(
-        'python3 phone_navigation.py '
-        '"http://PHONE_IP:8080/video"'
-    )
-
-    print("\nExample:")
-    print(
-        'python3 phone_navigation.py '
-        '"http://10.108.217.59:8080/video"'
-    )
-
-    sys.exit(1)
-
-
-# ============================================================
-# STARTUP
-# ============================================================
-
-print("=" * 68)
-print("              SAHAYAK DRISHTI")
-print("           PHONE NAVIGATION MODE")
-print("=" * 68)
-
-print("\nAre you sitting or walking?")
-print("  s = Sitting")
-print("  w = Walking")
-
+# Ask user mode
 while True:
+    mode = input("Are you sitting or walking?\n[s] Sitting\n[w] Walking\n> ").strip().lower()
 
-    mode_input = input(
-        "\nEnter s or w: "
-    ).strip().lower()
-
-    if mode_input == "s":
-        MODE = "sitting"
+    if mode in ("s", "w"):
         break
 
-    if mode_input == "w":
-        MODE = "walking"
-        break
+    print("Please enter s or w.")
 
-    print(
-        "[ERROR] Please enter only s or w."
-    )
+if mode == "s":
+    print("\nMode: SITTING")
+else:
+    print("\nMode: WALKING")
 
-print(
-    f"\n[SYSTEM] "
-    f"{MODE.capitalize()} mode selected."
-)
+# Camera URL
+if PHONE_URL is None:
+    PHONE_URL = input("\nEnter phone camera URL:\n> ").strip()
 
+print("\nLoading YOLOv8n...")
+model = YOLO(MODEL_PATH)
 
-# ============================================================
-# LOAD MODEL
-# ============================================================
+print("Connecting to phone camera...")
+cap = cv2.VideoCapture(PHONE_URL)
 
-print(
-    f"\n[SYSTEM] Phone stream: {PHONE_URL}"
-)
-
-print(
-    "[SYSTEM] Loading YOLOv8n..."
-)
-
-try:
-
-    model = YOLO(MODEL_PATH)
-
-except Exception as e:
-
-    print(
-        f"[ERROR] Could not load {MODEL_PATH}"
-    )
-
-    print(
-        f"[ERROR] {e}"
-    )
-
-    sys.exit(1)
-
-
-# ============================================================
-# CONNECT PHONE CAMERA
-# ============================================================
-
-print(
-    "[SYSTEM] Connecting to phone camera..."
-)
-
-cap = cv2.VideoCapture(
-    PHONE_URL
-)
+# Reduce OpenCV buffering
+cap.set(cv2.CAP_PROP_BUFFERSIZE, 1)
 
 if not cap.isOpened():
-
-    print(
-        "[ERROR] Cannot connect to phone camera."
-    )
-
-    print(
-        "[ERROR] Check IP Webcam and Wi-Fi."
-    )
-
+    print("\nERROR: Could not open phone camera.")
+    print("Check that IP Webcam is running.")
     sys.exit(1)
 
-
-# Try to reduce internal buffering.
-cap.set(
-    cv2.CAP_PROP_BUFFERSIZE,
-    1
-)
-
-print(
-    "[SYSTEM] Phone camera connected."
-)
-
-print(
-    "[SYSTEM] YOLO navigation engine started.\n"
-)
-
+print("Camera connected.")
+print("Fast mode started.")
+print("Press Ctrl+C to stop.")
+print()
 
 # ============================================================
-# CAMERA INFORMATION
+# STATE
 # ============================================================
-
-fps = cap.get(
-    cv2.CAP_PROP_FPS
-)
-
-if fps <= 1 or math.isnan(fps):
-
-    fps = 30.0
-
-frame_w = int(
-    cap.get(
-        cv2.CAP_PROP_FRAME_WIDTH
-    )
-)
-
-frame_h = int(
-    cap.get(
-        cv2.CAP_PROP_FRAME_HEIGHT
-    )
-)
-
-if frame_w <= 0:
-    frame_w = 1920
-
-if frame_h <= 0:
-    frame_h = 1080
-
-left_boundary_px = (
-    frame_w * LEFT_BOUNDARY
-)
-
-right_boundary_px = (
-    frame_w * RIGHT_BOUNDARY
-)
-
-
-# ============================================================
-# TRACK STORAGE
-# ============================================================
-
-tracks = {}
-
-next_track_id = 1
-
-last_alert_time = -10.0
-
-last_emergency_time = -10.0
-
-last_alert_signature = ""
-
-path_blocked = False
 
 frame_count = 0
 
-timeline_records = []
+last_alert_time = 0
 
+last_object = None
+last_direction = None
 
-# ============================================================
-# BASIC FUNCTIONS
-# ============================================================
+# Used for simple movement estimation
+previous_positions = {}
 
-def format_time(seconds):
-
-    return (
-        f"{int(seconds // 60):02d}:"
-        f"{int(seconds % 60):02d}"
-    )
-
-
-def point_distance(
-    x1,
-    y1,
-    x2,
-    y2
-):
-
-    return math.hypot(
-        x2 - x1,
-        y2 - y1
-    )
-
-
-# ============================================================
-# DISTANCE ESTIMATION
-# ============================================================
-
-def estimate_distance_meters(
-    label,
-    box_height
-):
-
-    if label not in AVERAGE_HEIGHTS:
-        return None
-
-    if box_height <= 10:
-        return None
-
-    real_height = (
-        AVERAGE_HEIGHTS[label]
-    )
-
-    raw_distance = (
-        real_height
-        * FOCAL_LENGTH_PIXELS
-        / box_height
-    )
-
-    # Do not trust extreme estimates.
-    if raw_distance < 0.5:
-        raw_distance = 0.5
-
-    if raw_distance > 20:
-        raw_distance = 20
-
-    # Coarse distance buckets.
-    if raw_distance < 1.5:
-        return 1
-
-    if raw_distance < 3.0:
-        return 2
-
-    if raw_distance < 4.5:
-        return 4
-
-    if raw_distance < 7.0:
-        return 6
-
-    return 10
-
-
-# ============================================================
-# ZONE
-# ============================================================
-
-def get_zone(x):
-
-    if x < left_boundary_px:
-        return "left"
-
-    if x > right_boundary_px:
-        return "right"
-
-    return "center"
-
-
-# ============================================================
-# OBJECT NAME
-# ============================================================
-
-def object_name(label):
-
-    if label == "dining table":
-        return "table"
-
-    if label == "cell phone":
-        return "phone"
-
-    return label
-
-
-# ============================================================
-# TRACKING
-# ============================================================
-
-def update_tracks(
-    detections,
-    current_time
-):
-
-    global next_track_id
-
-    matched_tracks = set()
-
-    # --------------------------------------------------------
-    # MATCH NEW DETECTIONS TO EXISTING TRACKS
-    # --------------------------------------------------------
-
-    for detection in detections:
-
-        best_track_id = None
-
-        best_distance = float("inf")
-
-        for track_id, track in tracks.items():
-
-            if track_id in matched_tracks:
-                continue
-
-            if (
-                track["label"]
-                != detection["label"]
-            ):
-                continue
-
-            if (
-                current_time
-                - track["last_seen"]
-                > MAX_TRACK_AGE
-            ):
-                continue
-
-            d = point_distance(
-                detection["x"],
-                detection["y"],
-                track["x"],
-                track["y"]
-            )
-
-            if d < best_distance:
-
-                best_distance = d
-
-                best_track_id = track_id
-
-        estimated_distance = (
-            estimate_distance_meters(
-                detection["label"],
-                detection["box_h"]
-            )
-        )
-
-        # ----------------------------------------------------
-        # EXISTING TRACK
-        # ----------------------------------------------------
-
-        if (
-            best_track_id is not None
-            and best_distance
-            <= MAX_TRACK_DISTANCE
-        ):
-
-            track = tracks[
-                best_track_id
-            ]
-
-            track["x"] = detection["x"]
-
-            track["y"] = detection["y"]
-
-            track["box_w"] = (
-                detection["box_w"]
-            )
-
-            track["box_h"] = (
-                detection["box_h"]
-            )
-
-            track["x1"] = detection["x1"]
-
-            track["x2"] = detection["x2"]
-
-            track["y1"] = detection["y1"]
-
-            track["y2"] = detection["y2"]
-
-            track["dist_m"] = (
-                estimated_distance
-            )
-
-            track["confidence"] = (
-                detection["confidence"]
-            )
-
-            track["last_seen"] = (
-                current_time
-            )
-
-            track["frames_seen"] += 1
-
-            track["zone"] = get_zone(
-                detection["x"]
-            )
-
-            track["history"].append({
-
-                "x": detection["x"],
-
-                "y": detection["y"],
-
-                "box_h":
-                    detection["box_h"],
-
-                "dist":
-                    estimated_distance,
-
-                "time":
-                    current_time
-
-            })
-
-            matched_tracks.add(
-                best_track_id
-            )
-
-        # ----------------------------------------------------
-        # NEW TRACK
-        # ----------------------------------------------------
-
-        else:
-
-            track_id = next_track_id
-
-            next_track_id += 1
-
-            tracks[track_id] = {
-
-                "id":
-                    track_id,
-
-                "label":
-                    detection["label"],
-
-                "x":
-                    detection["x"],
-
-                "y":
-                    detection["y"],
-
-                "x1":
-                    detection["x1"],
-
-                "y1":
-                    detection["y1"],
-
-                "x2":
-                    detection["x2"],
-
-                "y2":
-                    detection["y2"],
-
-                "box_w":
-                    detection["box_w"],
-
-                "box_h":
-                    detection["box_h"],
-
-                "dist_m":
-                    estimated_distance,
-
-                "confidence":
-                    detection["confidence"],
-
-                "last_seen":
-                    current_time,
-
-                "frames_seen":
-                    1,
-
-                "zone":
-                    get_zone(
-                        detection["x"]
-                    ),
-
-                "history":
-                    deque(
-                        [{
-                            "x":
-                                detection["x"],
-
-                            "y":
-                                detection["y"],
-
-                            "box_h":
-                                detection["box_h"],
-
-                            "dist":
-                                estimated_distance,
-
-                            "time":
-                                current_time
-
-                        }],
-                        maxlen=
-                            MOVEMENT_HISTORY
-                    )
-            }
-
-            matched_tracks.add(
-                track_id
-            )
-
-    # --------------------------------------------------------
-    # REMOVE OLD TRACKS
-    # --------------------------------------------------------
-
-    expired = [
-
-        track_id
-
-        for track_id, track
-        in tracks.items()
-
-        if (
-            current_time
-            - track["last_seen"]
-            > MAX_TRACK_AGE
-        )
-    ]
-
-    for track_id in expired:
-
-        del tracks[track_id]
-
-
-# ============================================================
-# MOVEMENT
-# ============================================================
-
-def get_movement(track):
-
-    history = track["history"]
-
-    if len(history) < 4:
-        return "stationary"
-
-    first = history[0]
-
-    last = history[-1]
-
-    dx = (
-        last["x"]
-        - first["x"]
-    )
-
-    dy = (
-        last["y"]
-        - first["y"]
-    )
-
-    # --------------------------------------------------------
-    # LEFT -> RIGHT / RIGHT -> LEFT
-    # --------------------------------------------------------
-
-    if abs(dx) >= MIN_HORIZONTAL_MOVEMENT:
-
-        if dx > 0:
-            return "left_to_right"
-
-        return "right_to_left"
-
-    # --------------------------------------------------------
-    # TOWARD / AWAY
-    # --------------------------------------------------------
-
-    if (
-        first["dist"] is not None
-        and last["dist"] is not None
-    ):
-
-        change = (
-            first["dist"]
-            - last["dist"]
-        )
-
-        if (
-            change
-            >= MIN_DISTANCE_CHANGE
-        ):
-
-            if (
-                abs(dy)
-                >= MIN_VERTICAL_MOVEMENT
-
-                or abs(
-                    last["box_h"]
-                    - first["box_h"]
-                )
-                >= 15
-            ):
-
-                return "toward"
-
-        if (
-            change
-            <= -MIN_DISTANCE_CHANGE
-        ):
-
-            if (
-                abs(dy)
-                >= MIN_VERTICAL_MOVEMENT
-
-                or abs(
-                    last["box_h"]
-                    - first["box_h"]
-                )
-                >= 15
-            ):
-
-                return "away"
-
-    return "stationary"
-
-
-def movement_phrase(track):
-
-    movement = get_movement(
-        track
-    )
-
-    if movement == "left_to_right":
-
-        return (
-            "moving left to right "
-            "across your path"
-        )
-
-    if movement == "right_to_left":
-
-        return (
-            "moving right to left "
-            "across your path"
-        )
-
-    if movement == "toward":
-
-        return (
-            "moving toward you"
-        )
-
-    if movement == "away":
-
-        return (
-            "moving away from you"
-        )
-
-    return None
-
-
-# ============================================================
-# CREATE SITTING MESSAGE
-# ============================================================
-
-def create_sitting_message(track):
-
-    name = object_name(
-        track["label"]
-    )
-
-    zone = track["zone"]
-
-    if zone == "center":
-
-        return (
-            f"{name.capitalize()} ahead."
-        )
-
-    if zone == "left":
-
-        return (
-            f"{name.capitalize()} "
-            f"on your left."
-        )
-
-    return (
-        f"{name.capitalize()} "
-        f"on your right."
-    )
-
-
-# ============================================================
-# CREATE WALKING MESSAGE
-# ============================================================
-
-def create_walking_message(track):
-
-    name = object_name(
-        track["label"]
-    )
-
-    zone = track["zone"]
-
-    dist_m = track["dist_m"]
-
-    movement = movement_phrase(
-        track
-    )
-
-    # --------------------------------------------------------
-    # DISTANCE TEXT
-    # --------------------------------------------------------
-
-    if dist_m is not None:
-
-        distance_text = (
-            f"about {dist_m} meters"
-        )
-
-    else:
-
-        distance_text = "nearby"
-
-    # --------------------------------------------------------
-    # CENTER
-    # --------------------------------------------------------
-
-    if zone == "center":
-
-        if movement:
-
-            return (
-                f"{name.capitalize()} ahead, "
-                f"{distance_text}, "
-                f"{movement}. "
-                f"Be careful."
-            )
-
-        if (
-            dist_m is not None
-            and dist_m <= 1
-        ):
-
-            return (
-                f"Careful, "
-                f"{name} ahead, "
-                f"about 1 meter."
-            )
-
-        return (
-            f"{name.capitalize()} ahead, "
-            f"{distance_text}. "
-            f"Stay alert."
-        )
-
-    # --------------------------------------------------------
-    # LEFT
-    # --------------------------------------------------------
-
-    if zone == "left":
-
-        if movement:
-
-            return (
-                f"{name.capitalize()} "
-                f"on your left, "
-                f"{distance_text}, "
-                f"{movement}."
-            )
-
-        return (
-            f"{name.capitalize()} "
-            f"on your left, "
-            f"{distance_text}. "
-            f"Stay slightly right."
-        )
-
-    # --------------------------------------------------------
-    # RIGHT
-    # --------------------------------------------------------
-
-    if movement:
-
-        return (
-            f"{name.capitalize()} "
-            f"on your right, "
-            f"{distance_text}, "
-            f"{movement}."
-        )
-
-    return (
-        f"{name.capitalize()} "
-        f"on your right, "
-        f"{distance_text}. "
-        f"Stay slightly left."
-    )
-
-
-# ============================================================
-# DETERMINE WHETHER OBJECT IS A WALKING HAZARD
-# ============================================================
-
-def is_walking_hazard(track):
-
-    label = track["label"]
-
-    zone = track["zone"]
-
-    # Anything in the center is potentially relevant.
-    if zone == "center":
-        return True
-
-    # Large physical obstacles on either side.
-    if label in {
-        "chair",
-        "couch",
-        "dining table",
-        "bench"
-    }:
-
-        # Object must overlap the walking corridor.
-        if (
-            track["x2"]
-            > left_boundary_px
-
-            and track["x1"]
-            < right_boundary_px
-        ):
-
-            return True
-
-    # Moving people/vehicles near the corridor.
-    if label in {
-        "person",
-        "bicycle",
-        "motorcycle",
-        "car",
-        "bus",
-        "truck"
-    }:
-
-        return True
-
-    return False
-
-
-# ============================================================
-# EMERGENCY DECISION
-# ============================================================
-# IMPORTANT:
-# We do NOT trigger emergency merely because a box is large.
-#
-# We require:
-#   1. object is centered
-#   2. object has been confirmed
-#   3. object is close OR clearly approaching
-# ============================================================
-
-def is_emergency(track):
-
-    if track["zone"] != "center":
-        return False
-
-    if (
-        track["frames_seen"]
-        < MIN_CONFIRMATIONS
-    ):
-        return False
-
-    distance_m = track["dist_m"]
-
-    movement = get_movement(
-        track
-    )
-
-    # Very close confirmed object.
-    if (
-        distance_m is not None
-        and distance_m <= 1
-    ):
-
-        return True
-
-    # Confirmed object approaching.
-    if (
-        movement == "toward"
-        and distance_m is not None
-        and distance_m <= 3
-    ):
-
-        return True
-
-    return False
-
+# Prevent "path clear" spam
+path_blocked = False
 
 # ============================================================
 # MAIN LOOP
 # ============================================================
 
-print(
-    "=" * 68
-)
-
-print(
-    " [SAHAYAK DRISHTI] "
-    "High-Priority Safety Engine: "
-    f"Phone Camera ({MODE.upper()} MODE)"
-)
-
-print(
-    "=" * 68
-)
-
-print()
-
-
 try:
 
-    while cap.isOpened():
+    while True:
 
         ret, frame = cap.read()
 
         if not ret:
-
-            print(
-                "\n[ERROR] "
-                "Lost phone camera stream."
-            )
-
-            break
+            print("[WARNING] Camera frame unavailable.")
+            time.sleep(0.2)
+            continue
 
         frame_count += 1
 
-        current_time = (
-            frame_count / fps
+        # ----------------------------------------------------
+        # Skip frames to improve Raspberry Pi speed
+        # ----------------------------------------------------
+
+        if frame_count % FRAME_SKIP != 0:
+            continue
+
+        # ----------------------------------------------------
+        # Resize BEFORE YOLO
+        # Huge performance improvement
+        # ----------------------------------------------------
+
+        frame = cv2.resize(frame, (640, 360))
+
+        frame_height, frame_width = frame.shape[:2]
+
+        # ----------------------------------------------------
+        # YOLO
+        # ----------------------------------------------------
+
+        results = model.predict(
+            source=frame,
+            imgsz=YOLO_SIZE,
+            conf=CONFIDENCE,
+            verbose=False,
+            device="cpu"
         )
 
+        detections = []
+
+        for result in results:
+
+            if result.boxes is None:
+                continue
+
+            for box in result.boxes:
+
+                confidence = float(box.conf[0])
+
+                if confidence < CONFIDENCE:
+                    continue
+
+                class_id = int(box.cls[0])
+                name = model.names[class_id]
+
+                if name not in ALLOWED_OBJECTS:
+                    continue
+
+                x1, y1, x2, y2 = map(int, box.xyxy[0])
+
+                box_width = x2 - x1
+                box_height = y2 - y1
+
+                if box_height <= 5:
+                    continue
+
+                center_x = (x1 + x2) // 2
+                center_y = (y1 + y2) // 2
+
+                direction = get_direction(center_x, frame_width)
+
+                distance = estimate_distance(
+                    name,
+                    box_height
+                )
+
+                detections.append({
+                    "name": name,
+                    "confidence": confidence,
+                    "x": center_x,
+                    "y": center_y,
+                    "height": box_height,
+                    "direction": direction,
+                    "distance": distance,
+                })
+
         # ----------------------------------------------------
-        # FRAME SKIPPING
+        # Nothing detected
         # ----------------------------------------------------
 
-        if (
-            frame_count
-            % FRAME_SKIP
-            != 0
-        ):
+        if not detections:
+
+            if path_blocked:
+
+                now = time.time()
+
+                if now - last_alert_time >= ALERT_COOLDOWN:
+
+                    print("[INFO] Path is clear.")
+
+                    last_alert_time = now
+                    path_blocked = False
 
             continue
 
         # ----------------------------------------------------
-        # YOLO INFERENCE
+        # Sort:
+        # 1. Ahead first
+        # 2. Larger object first
         # ----------------------------------------------------
 
-        results = model(
-            frame,
-            imgsz=IMG_SIZE,
-            conf=CONFIDENCE,
-            verbose=False
-        )
-
-        boxes = results[0].boxes
-
-        detections = []
-
-        if (
-            boxes is not None
-            and len(boxes) > 0
-        ):
-
-            for box in boxes:
-
-                confidence = float(
-                    box.conf[0]
-                )
-
-                # Extra safety check.
-                if (
-                    confidence
-                    < CONFIDENCE
-                ):
-                    continue
-
-                class_id = int(
-                    box.cls[0]
-                )
-
-                label = model.names[
-                    class_id
-                ]
-
-                if (
-                    label
-                    not in ALLOWED_OBJECTS
-                ):
-                    continue
-
-                x1, y1, x2, y2 = (
-                    box.xyxy[0].tolist()
-                )
-
-                box_width = (
-                    x2 - x1
-                )
-
-                box_height = (
-                    y2 - y1
-                )
-
-                center_x = (
-                    x1 + x2
-                ) / 2
-
-                center_y = (
-                    y1 + y2
-                ) / 2
-
-                detections.append({
-
-                    "label":
-                        label,
-
-                    "confidence":
-                        confidence,
-
-                    "x":
-                        center_x,
-
-                    "y":
-                        center_y,
-
-                    "x1":
-                        x1,
-
-                    "y1":
-                        y1,
-
-                    "x2":
-                        x2,
-
-                    "y2":
-                        y2,
-
-                    "box_w":
-                        box_width,
-
-                    "box_h":
-                        box_height
-                })
-
-        # ----------------------------------------------------
-        # UPDATE TRACKS
-        # ----------------------------------------------------
-
-        update_tracks(
-            detections,
-            current_time
-        )
-
-        # ----------------------------------------------------
-        # ONLY USE RECENT + CONFIRMED OBJECTS
-        # ----------------------------------------------------
-
-        visible = [
-
-            track
-
-            for track
-            in tracks.values()
-
-            if (
-                current_time
-                - track["last_seen"]
-                <= 0.45
-
-                and track["frames_seen"]
-                >= MIN_CONFIRMATIONS
+        detections.sort(
+            key=lambda d: (
+                d["direction"] != "ahead",
+                -d["height"]
             )
-        ]
+        )
+
+        best = detections[0]
+
+        name = best["name"]
+        direction = best["direction"]
+        distance = best["distance"]
+
+        # ----------------------------------------------------
+        # SIMPLE MOVEMENT ESTIMATION
+        # ----------------------------------------------------
+
+        movement = ""
+
+        previous = previous_positions.get(name)
+
+        if previous is not None:
+
+            old_x, old_y, old_time = previous
+
+            dx = best["x"] - old_x
+            dy = best["y"] - old_y
+
+            elapsed = time.time() - old_time
+
+            if elapsed > 0:
+
+                # Object moving toward camera:
+                # bounding box becoming taller
+                old_height = previous_positions.get(
+                    name + "_height",
+                    best["height"]
+                )
+
+                height_change = best["height"] - old_height
+
+                if height_change > 12:
+                    movement = "moving toward you"
+
+                elif height_change < -12:
+                    movement = "moving away"
+
+                elif abs(dx) > 35:
+
+                    if dx > 0:
+                        movement = "moving left to right"
+                    else:
+                        movement = "moving right to left"
+
+        previous_positions[name] = (
+            best["x"],
+            best["y"],
+            time.time()
+        )
+
+        previous_positions[name + "_height"] = best["height"]
+
+        # ----------------------------------------------------
+        # CURRENT TIME
+        # ----------------------------------------------------
+
+        now = time.time()
 
         # ----------------------------------------------------
         # SITTING MODE
         # ----------------------------------------------------
 
-        if MODE == "sitting":
+        if mode == "s":
 
-            if not visible:
-
-                continue
-
-            # Largest/closest useful object first.
-            visible.sort(
-
-                key=lambda track: (
-
-                    track["box_h"],
-
-                    track["confidence"]
-
-                ),
-
-                reverse=True
+            # Only announce when object/direction changes
+            changed = (
+                name != last_object or
+                direction != last_direction
             )
 
-            lead = visible[0]
+            if changed and now - last_alert_time >= ALERT_COOLDOWN:
 
-            signature = (
-
-                "SITTING_"
-
-                + lead["label"]
-
-                + "_"
-
-                + lead["zone"]
-            )
-
-            cooldown_expired = (
-
-                current_time
-                - last_alert_time
-                >= ALERT_COOLDOWN
-            )
-
-            if (
-                cooldown_expired
-                and signature
-                != last_alert_signature
-            ):
-
-                timestamp = (
-                    format_time(
-                        current_time
-                    )
+                message = get_position_message(
+                    name,
+                    direction
                 )
 
-                message = (
-                    create_sitting_message(
-                        lead
-                    )
-                )
+                print(f"[ALERT] {message}")
 
-                print(
-                    f"[{timestamp}] "
-                    f"[ALERT] "
-                    f"{message}"
-                )
+                last_alert_time = now
 
-                last_alert_time = (
-                    current_time
-                )
-
-                last_alert_signature = (
-                    signature
-                )
-
-                timeline_records.append({
-
-                    "time":
-                        timestamp,
-
-                    "message":
-                        "[ALERT] "
-                        + message
-
-                })
+                last_object = name
+                last_direction = direction
 
             continue
 
@@ -1314,271 +453,90 @@ try:
         # WALKING MODE
         # ----------------------------------------------------
 
-        hazards = [
-
-            track
-
-            for track
-            in visible
-
-            if is_walking_hazard(
-                track
-            )
-        ]
-
-        # ----------------------------------------------------
-        # PATH CLEAR
-        # ----------------------------------------------------
-
-        if not hazards:
-
-            if path_blocked:
-
-                timestamp = (
-                    format_time(
-                        current_time
-                    )
-                )
-
-                message = (
-                    "[INFO] "
-                    "Path is clear."
-                )
-
-                print(
-                    f"[{timestamp}] "
-                    f"{message}"
-                )
-
-                timeline_records.append({
-
-                    "time":
-                        timestamp,
-
-                    "message":
-                        message
-
-                })
-
-                path_blocked = False
-
-            continue
-
-        # We have at least one hazard.
-        path_blocked = True
-
-        # ----------------------------------------------------
-        # PRIORITIZE
-        # ----------------------------------------------------
-
-        hazards.sort(
-
-            key=lambda track: (
-
-                track["zone"]
-                == "center",
-
-                track["label"]
-                == "person",
-
-                track["dist_m"]
-                is not None,
-
-                -(track["dist_m"] or 999),
-
-                track["box_h"]
-
-            ),
-
-            reverse=True
+        dangerous = is_dangerous(
+            name,
+            direction,
+            distance
         )
-
-        lead = hazards[0]
 
         # ----------------------------------------------------
         # EMERGENCY
         # ----------------------------------------------------
 
-        emergency = is_emergency(
-            lead
-        )
+        if dangerous and now - last_alert_time >= ALERT_COOLDOWN:
 
-        emergency_allowed = (
+            d_text = distance_text(distance)
 
-            current_time
-            - last_emergency_time
-            >= EMERGENCY_COOLDOWN
-        )
-
-        normal_cooldown_expired = (
-
-            current_time
-            - last_alert_time
-            >= ALERT_COOLDOWN
-        )
-
-        # ----------------------------------------------------
-        # ALERT SIGNATURE
-        # ----------------------------------------------------
-
-        movement = get_movement(
-            lead
-        )
-
-        signature = (
-
-            "WALKING_"
-
-            + lead["label"]
-
-            + "_"
-
-            + lead["zone"]
-
-            + "_"
-
-            + str(lead["dist_m"])
-
-            + "_"
-
-            + movement
-        )
-
-        should_alert = False
-
-        # ----------------------------------------------------
-        # EMERGENCY ALERT
-        # ----------------------------------------------------
-
-        if (
-            emergency
-            and emergency_allowed
-        ):
-
-            should_alert = True
-
-            last_emergency_time = (
-                current_time
-            )
-
-        # ----------------------------------------------------
-        # NORMAL ALERT
-        # ----------------------------------------------------
-
-        elif (
-            normal_cooldown_expired
-            and signature
-            != last_alert_signature
-        ):
-
-            should_alert = True
-
-        # ----------------------------------------------------
-        # PRINT ALERT
-        # ----------------------------------------------------
-
-        if should_alert:
-
-            timestamp = (
-                format_time(
-                    current_time
+            if d_text:
+                message = (
+                    f"Careful, {name} {direction}, "
+                    f"{d_text}."
                 )
-            )
-
-            message = (
-                create_walking_message(
-                    lead
-                )
-            )
-
-            if emergency:
-
-                prefix = "[EMERGENCY]"
-
             else:
+                message = (
+                    f"Careful, {name} {direction}."
+                )
 
-                prefix = "[ALERT]"
+            print(f"[EMERGENCY] {message}")
 
-            print(
-                f"[{timestamp}] "
-                f"{prefix} "
-                f"{message}"
+            last_alert_time = now
+
+            path_blocked = True
+
+            last_object = name
+            last_direction = direction
+
+            continue
+
+        # ----------------------------------------------------
+        # NORMAL WALKING ALERT
+        # ----------------------------------------------------
+
+        changed = (
+            name != last_object or
+            direction != last_direction
+        )
+
+        if changed and now - last_alert_time >= ALERT_COOLDOWN:
+
+            message = get_walking_message(
+                name,
+                direction,
+                distance
             )
 
-            last_alert_time = (
-                current_time
-            )
+            if movement:
+                message = message[:-1] + f", {movement}."
 
-            last_alert_signature = (
-                signature
-            )
+            print(f"[ALERT] {message}")
 
-            timeline_records.append({
+            last_alert_time = now
 
-                "time":
-                    timestamp,
+            last_object = name
+            last_direction = direction
 
-                "message":
-                    prefix
-                    + " "
-                    + message
+            if direction == "ahead":
+                path_blocked = True
 
-            })
+        # ----------------------------------------------------
+        # CLEAN OLD POSITION DATA
+        # ----------------------------------------------------
 
+        if len(previous_positions) > 30:
 
-# ============================================================
-# STOP WITH CTRL+C
-# ============================================================
+            keys = list(previous_positions.keys())
+
+            for key in keys[:-20]:
+                del previous_positions[key]
 
 except KeyboardInterrupt:
 
-    print(
-        "\n\n[SYSTEM] "
-        "Navigation stopped by user."
-    )
-
-
-# ============================================================
-# CLEANUP
-# ============================================================
+    print("\n")
+    print("============================================================")
+    print("             NAVIGATION STOPPED")
+    print("============================================================")
 
 finally:
 
     cap.release()
-
-
-# ============================================================
-# SUMMARY
-# ============================================================
-
-print(
-    "\n"
-    + "=" * 68
-)
-
-print(
-    "          HIGH-PRIORITY ASSISTIVE SUMMARY"
-)
-
-print(
-    "=" * 68
-)
-
-if timeline_records:
-
-    for record in timeline_records:
-
-        print(
-            f"[{record['time']}] "
-            f"{record['message']}"
-        )
-
-else:
-
-    print(
-        "No alerts recorded."
-    )
-
-print(
-    "=" * 68
-)
+    cv2.destroyAllWindows()
